@@ -1,0 +1,29 @@
+[package]
+name = "fbservo"
+version = "0.1.0"
+edition = "2021"
+description = "Servo (Rust browser engine) rendering straight into the Linux framebuffer"
+
+[[bin]]
+name = "fbservo"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+url = "2.5"
+dpi = "0.1"
+euclid = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
+# multiprocess / clipboard は使わない (クリップボードは X/Wayland 前提)
+servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit"] }
+
+# 1px 未満しかはみ出していない overflow: auto の箱がスクロールを吸い込む問題を直した版
+# (vendor/servo-paint/webview_renderer.rs の scroll_node_or_ancestor_skipping_subpixel)
+[patch.crates-io]
+servo-paint = { path = "vendor/servo-paint" }
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = true

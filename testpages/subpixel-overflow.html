@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>subpixel overflow</title>
+<style>
+  body { margin: 0; font: 20px sans-serif; }
+  .pad { height: 300px; background: #eef; }
+  #box { overflow: auto; height: 200px; background: #fdd; }
+  #box > div { height: 200.4px; }
+  .tall { height: 3000px; background: linear-gradient(#fff, #444); }
+</style>
+<div class="pad">上</div>
+<div id="box"><div>中身が 0.4px だけはみ出す overflow: auto の箱 (画面中央)</div></div>
+<div class="tall">下</div>
