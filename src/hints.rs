@@ -1,5 +1,7 @@
 //! リンクヒント (f)。fbrowse と同じく、クリックできる要素に 2 文字のラベルをページの
-//! DOM として差し込み、ラベルを打つとその要素の中心をクリックする。
+//! DOM として差し込み、ラベルを打つとその要素の中心をクリックする。入力欄なら、そのまま
+//! 入力モードへ入る (fbrowse の i の代わり)。ページを開いたときに入力欄へフォーカスが
+//! 当たっているかを調べる JS も、入力欄の判定を共有するのでここに置く。
 //!
 //! ラベルはページの中に描かれるので、自前で絵に文字を重ねる仕組みは要らない。
 
@@ -10,11 +12,24 @@ use std::rc::Rc;
 /// ラベルに使う文字。ヒントモードで f を取消に使うため f は入れない (fbrowse と同じ)。
 pub const LABEL_CHARS: &str = "asdjklghqwertuiopzxcvbnm";
 
+/// 要素が文字を打てる入力欄かを調べる JS の関数 (SHOW_JS と FOCUS_JS で使う)。
+/// textarea と、文字を打てる種類の input。無効や読み取り専用のものは除く。
+macro_rules! is_editable_js {
+    () => {
+        r#"el => !!el && !el.disabled && !el.readOnly && (el.tagName === 'TEXTAREA' ||
+    (el.tagName === 'INPUT' && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'color', 'range', 'hidden'].includes(el.type)))"#
+    };
+}
+
 /// クリックできる要素に 2 文字のラベルを出し、その中心の座標 (CSS px) を返す。
 /// fbrowse の HINTS_JS から、CSS zoom の補正を外したもの (fbservo は Servo のページズームを
 /// 使うので、getBoundingClientRect の値をそのままクリック位置にできる)。
 /// ラベルは pointer-events: none にして、小さい要素の中心を覆ってもクリックが下へ届くようにする。
-pub const SHOW_JS: &str = r#"(() => {
+/// 文字を打てる入力欄には editable を付ける (クリックしたらそのまま入力モードへ入るため)。
+pub const SHOW_JS: &str = concat!(
+    "(() => {\n  const isEditable = ",
+    is_editable_js!(),
+    r#";
   document.querySelectorAll('.__hint__').forEach(el => el.remove());
   const chars = 'asdjklghqwertuiopzxcvbnm'.split('');
   const keys = [];
@@ -39,10 +54,28 @@ pub const SHOW_JS: &str = r#"(() => {
       box-shadow: 0 1px 3px rgba(0,0,0,0.5);`;
     document.body.appendChild(hint);
     const a = el.closest('a');
-    hints.push({ key, x: r.left + r.width / 2, y: r.top + r.height / 2, href: a ? a.href : null });
+    hints.push({ key, x: r.left + r.width / 2, y: r.top + r.height / 2, href: a ? a.href : null,
+      editable: isEditable(el) });
   });
   return hints;
-})()"#;
+})()"#
+);
+
+/// 読み込み終えたページで入力欄にフォーカスが当たっているかを返す (検索欄など)。
+/// Servo 0.7 は autofocus 属性でフォーカスを当てないので、ほかに何もフォーカスされて
+/// いなければ、autofocus の付いた入力欄に代わりに当てる。
+pub const FOCUS_JS: &str = concat!(
+    "(() => {\n  const isEditable = ",
+    is_editable_js!(),
+    r#";
+  const active = document.activeElement;
+  if (!active || active === document.body) {
+    const el = document.querySelector('[autofocus]');
+    if (isEditable(el)) el.focus();
+  }
+  return isEditable(document.activeElement);
+})()"#
+);
 
 pub const CLEAR_JS: &str = "document.querySelectorAll('.__hint__').forEach(el => el.remove())";
 
@@ -62,6 +95,8 @@ pub struct Hint {
     pub y: f32,
     /// リンクなら行き先
     pub href: Option<String>,
+    /// 文字を打てる入力欄 (textarea や type=text などの input)
+    pub editable: bool,
 }
 
 /// SHOW_JS の結果を読む。形の合わない要素は飛ばす。
@@ -88,7 +123,8 @@ pub fn parse(v: JSValue) -> Vec<Hint> {
                 Some(JSValue::String(s)) => Some(s),
                 _ => None,
             };
-            Some(Hint { label, x, y, href })
+            let editable = matches!(m.remove("editable"), Some(JSValue::Boolean(true)));
+            Some(Hint { label, x, y, href, editable })
         })
         .collect()
 }
@@ -126,17 +162,18 @@ mod tests {
 
     #[test]
     fn parses_hints() {
-        let obj = |key: &str, href: JSValue| {
+        let obj = |key: &str, href: JSValue, editable: bool| {
             JSValue::Object(HashMap::from([
                 ("key".to_string(), JSValue::String(key.to_string())),
                 ("x".to_string(), JSValue::Number(10.5)),
                 ("y".to_string(), JSValue::Number(20.0)),
                 ("href".to_string(), href),
+                ("editable".to_string(), JSValue::Boolean(editable)),
             ]))
         };
         let v = JSValue::Array(vec![
-            obj("aa", JSValue::String("https://example.com/".into())),
-            obj("as", JSValue::Null),
+            obj("aa", JSValue::String("https://example.com/".into()), false),
+            obj("as", JSValue::Null, true),
             JSValue::Number(1.0),
         ]);
         let hints = parse(v);
@@ -144,6 +181,8 @@ mod tests {
         assert_eq!((hints[0].label.as_str(), hints[0].x, hints[0].y), ("aa", 10.5, 20.0));
         assert_eq!(hints[0].href.as_deref(), Some("https://example.com/"));
         assert_eq!(hints[1].href, None);
+        assert!(!hints[0].editable);
+        assert!(hints[1].editable);
         assert!(parse(JSValue::Null).is_empty());
     }
 

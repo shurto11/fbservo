@@ -26,7 +26,9 @@ const USAGE: &str = "\
 キー (fbrowse と同じ配置):
   hjkl          スクロール            gg / G       先頭 / 末尾
   f             リンクヒント (ラベルの 2 文字でクリック。f / Esc で取消)
-  i             入力 (Enter で確定)   d            直前の入力を削除
+                入力欄を選ぶとそのまま入力 (Enter で確定、Esc で戻る)
+                開いたページの入力欄にフォーカスがあれば、選ばなくても入力
+  d             直前の入力を削除
   b / r         戻る / 再読込         Enter/Space  そのままページへ送る (矢印も)
   s             描き直し              + - 0        ズームイン / アウト / リセット
   t             新しいタブ            ] / [        次 / 前のタブ
@@ -151,7 +153,8 @@ fn log_path() -> PathBuf {
 
 enum Mode {
     Normal,
-    /// キーをそのままページへ送る
+    /// キーをそのままページへ送る (リンクヒントで入力欄を選ぶか、開いたページの入力欄に
+    /// フォーカスが当たっていると入る)
     Insert,
     /// 端末の最下行で URL を入力中 (その間は fb0 へ描かない)
     Prompt(Open, String),
@@ -306,6 +309,10 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
         eng.spin();
         // ヒントの JS の結果は spin の中で届く。先に打ったラベルがあればここでクリックする
         finish_hint(&eng, &mut ui);
+        // 開いたページが最初から入力欄にフォーカスを当てていたら (検索欄など)、そのまま打てるようにする
+        if eng.take_input_focused() && matches!(ui.mode, Mode::Normal) {
+            enter_insert(&mut ui);
+        }
         if ui.mode.uses_terminal() {
             continue;
         }
@@ -396,7 +403,6 @@ enum Cmd {
     Forward,
     Reload,
     Redraw,
-    Insert,
     DeleteTyped,
     NewTab,
     EditUrl,
@@ -447,7 +453,6 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
         Key::Char('L') => Cmd::Forward,
         Key::Char('r') => Cmd::Reload,
         Key::Char('s') => Cmd::Redraw,
-        Key::Char('i') => Cmd::Insert,
         Key::Char('d') => Cmd::DeleteTyped,
         Key::Char('t') => Cmd::NewTab,
         Key::Char('O') => Cmd::EditUrl,
@@ -467,6 +472,7 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
         Key::Char('T') => Cmd::NotYet("タブを別ペインへ移す", "3-8"),
         Key::Char('M' | 'P') => Cmd::NotYet("mpv で再生", "4-1"),
         Key::Char('c' | 'C') => Cmd::NotNeeded("動画モード (fbservo は常に動く絵を描いている)"),
+        Key::Char('i') => Cmd::NotNeeded("入力モード (f で入力欄を選ぶと入る)"),
         _ => Cmd::None,
     }
 }
@@ -570,6 +576,7 @@ fn handle_key(eng: &mut Engine, ui: &mut Ui, k: Key) -> Action {
 }
 
 /// ヒントモードで、ラベルが 2 文字そろい、ヒントも届いていたらクリックしてノーマルモードへ戻る。
+/// クリックしたのが入力欄なら、ノーマルモードではなく入力モードへ入る。
 /// ヒントが届く前にラベルを打ち終えることもあるので、キーを押したときと spin のあとの両方で呼ぶ。
 fn finish_hint(eng: &Engine, ui: &mut Ui) {
     let Mode::Hint(h) = &mut ui.mode else {
@@ -579,6 +586,7 @@ fn finish_hint(eng: &Engine, ui: &mut Ui) {
     let Some(hints) = h.hints() else {
         return;
     };
+    let mut editable = false;
     if hints.is_empty() {
         say("クリックできるものがありません");
     } else if typed.chars().count() < 2 {
@@ -594,11 +602,24 @@ fn finish_hint(eng: &Engine, ui: &mut Ui) {
                     hint.href.as_deref().unwrap_or("")
                 ));
                 eng.click(hint.x, hint.y);
+                editable = hint.editable;
             }
             None => say(&format!("ヒント不一致: {typed}")),
         }
     }
-    ui.mode = Mode::Normal;
+    if editable {
+        enter_insert(ui);
+    } else {
+        ui.mode = Mode::Normal;
+    }
+}
+
+/// 入力モードへ入る。ヒントで入力欄を選んだときと、開いたページが入力欄にフォーカスを
+/// 当てていたとき。
+fn enter_insert(ui: &mut Ui) {
+    ui.mode = Mode::Insert;
+    ui.typed = 0;
+    say("入力モード (Enter で確定、Esc で戻る)");
 }
 
 fn run_cmd(eng: &mut Engine, ui: &mut Ui, cmd: Cmd) -> Action {
@@ -616,11 +637,6 @@ fn run_cmd(eng: &mut Engine, ui: &mut Ui, cmd: Cmd) -> Action {
         Cmd::Forward => eng.forward(),
         Cmd::Reload => eng.reload(),
         Cmd::Redraw => eng.request_frame(),
-        Cmd::Insert => {
-            ui.mode = Mode::Insert;
-            ui.typed = 0;
-            say("入力モード (Enter で確定、Esc で戻る)");
-        }
         Cmd::DeleteTyped => {
             say(&format!("入力削除 ({} 文字)", ui.typed));
             for _ in 0..std::mem::take(&mut ui.typed) {
@@ -681,6 +697,8 @@ mod tests {
         assert_eq!(cmd('Q'), Cmd::Quit);
         assert_eq!(cmd('f'), Cmd::Hints);
         assert_eq!(cmd('q'), Cmd::None);
+        // 入力モードはヒントで入力欄を選んで入るので、i は使わない
+        assert!(matches!(cmd('i'), Cmd::NotNeeded(_)));
         // gg で先頭。間に別のキーが入ったら数え直す
         assert_eq!(cmd('g'), Cmd::None);
         assert_eq!(cmd('g'), Cmd::Top);

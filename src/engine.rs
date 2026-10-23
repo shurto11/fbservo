@@ -11,7 +11,7 @@ use dpi::PhysicalSize;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, DeviceVector2D,
-    EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
+    EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, RenderingContext, RgbaImage, Scroll, Servo,
     ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WebViewVector,
 };
@@ -51,6 +51,8 @@ pub struct Delegate {
     frame_ready: Cell<bool>,
     /// window.open / target=_blank で作られた新しい WebView の作成要求
     new_view: RefCell<Option<CreateNewWebViewRequest>>,
+    /// 読み込みを終えたタブ。spin で今のタブか確かめ、入力欄にフォーカスがあるか調べる
+    loaded: RefCell<Vec<WebView>>,
 }
 
 impl WebViewDelegate for Delegate {
@@ -66,8 +68,11 @@ impl WebViewDelegate for Delegate {
         eprintln!("[title] {}", title.unwrap_or_default());
     }
 
-    fn notify_load_status_changed(&self, _: WebView, status: LoadStatus) {
+    fn notify_load_status_changed(&self, view: WebView, status: LoadStatus) {
         eprintln!("[load] {status:?}");
+        if status == LoadStatus::Complete {
+            self.loaded.borrow_mut().push(view);
+        }
     }
 
     fn notify_crashed(&self, _: WebView, reason: String, _backtrace: Option<String>) {
@@ -91,6 +96,8 @@ pub struct Engine {
     delegate: Rc<Delegate>,
     servo: Servo,
     ctx: Rc<SoftwareRenderingContext>,
+    /// 今のタブが読み込みを終えたとき、入力欄にフォーカスが当たっていた (FOCUS_JS の結果)
+    input_focused: Rc<Cell<bool>>,
     pub width: u32,
     pub height: u32,
     scale: f32,
@@ -112,7 +119,17 @@ impl Engine {
             .delegate(delegate.clone())
             .build();
         view.set_focused(true);
-        Ok(Engine { views: vec![view], current: 0, delegate, servo, ctx, width, height, scale })
+        Ok(Engine {
+            views: vec![view],
+            current: 0,
+            delegate,
+            servo,
+            ctx,
+            input_focused: Rc::default(),
+            width,
+            height,
+            scale,
+        })
     }
 
     pub fn view(&self) -> &WebView {
@@ -126,6 +143,8 @@ impl Engine {
 
     /// Servo のイベントループを 1 回回す。ページが新しいウィンドウを開こうとしていたら
     /// (window.open, target=_blank)、今のタブの右に新しいタブとして開く。
+    /// 今のタブが読み込みを終えていたら、入力欄にフォーカスがあるか調べる
+    /// (結果は後の spin で届き、take_input_focused で受け取る)。
     pub fn spin(&mut self) {
         self.servo.spin_event_loop();
         let req = self.delegate.new_view.borrow_mut().take();
@@ -137,6 +156,20 @@ impl Engine {
                 .build();
             self.add_tab(view);
         }
+        let loaded = std::mem::take(&mut *self.delegate.loaded.borrow_mut());
+        if loaded.contains(self.view()) {
+            let focused = self.input_focused.clone();
+            self.view().evaluate_javascript(hints::FOCUS_JS, move |r| match r {
+                Ok(JSValue::Boolean(true)) => focused.set(true),
+                Ok(_) => {}
+                Err(e) => eprintln!("[focus] JS が失敗: {e:?}"),
+            });
+        }
+    }
+
+    /// 読み込みを終えた今のタブで、入力欄にフォーカスが当たっていたら true を返す (1 回だけ)。
+    pub fn take_input_focused(&self) -> bool {
+        self.input_focused.replace(false)
     }
 
     /// URL を新しいタブで開き、そのタブを表示する。
