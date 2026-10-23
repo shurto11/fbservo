@@ -6,7 +6,9 @@
 mod engine;
 mod fb;
 mod hints;
+mod kbd;
 mod scan;
+mod smooth;
 mod term;
 mod tmux;
 
@@ -14,6 +16,8 @@ use anyhow::{Context, Result};
 use engine::Engine;
 use fb::{Fb, Image, Rect};
 use hints::HintMode;
+use kbd::{Kbd, Press};
+use smooth::{Pace, Smooth};
 use std::io::Read;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -255,7 +259,7 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     let (wake_fd, waker) = engine::pipe_waker()?;
     let first = target.and_then(resolve);
     let mode = if first.is_some() { Mode::Normal } else { Mode::Prompt(Open::Here, String::new()) };
-    let mut ui = Ui { mode, pending_g: false, typed: 0 };
+    let mut ui = Ui { mode, pending_g: false, typed: 0, smooth: Smooth::default(), kbd: Kbd::open() };
     let url = first.unwrap_or_else(|| Url::parse("about:blank").unwrap());
 
     // tmux の中なら自分のペインに描き、ペインが動いたり隠れたりしたら追いかける
@@ -285,6 +289,12 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     let mut spare = Vec::new();
     let mut last_blit = Instant::now();
     eprintln!("[scan] {}", fb.describe());
+    // スクロール中のコマの間隔 (垂直同期の何回分か) と、直前のコマを出した時刻
+    let mut pace = Pace::new(fb.period());
+    let mut presented: Option<Instant> = None;
+    let mut blit_took = Duration::ZERO;
+    // 次のフレームが届いたのに気づいた時刻 (前のフレームを fb0 に書くまで待っている間に気づいたとき)
+    let mut ready_at: Option<Instant> = None;
     // まだ画面に反映していない最初のスクロールキーを押した時刻
     let mut key_at: Option<Instant> = None;
     let mut stdin = std::io::stdin();
@@ -293,15 +303,27 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     let ms = |t: Instant| (t - start).as_secs_f64() * 1000.0;
 
     loop {
-        let timeout = if shown && eng.animating() { 16 } else { 1000 };
-        let mut fds = [
-            libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
-        ];
-        unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) };
+        let timeout = if !shown {
+            1000
+        } else if eng.frame_pending() {
+            // 前のフレームを書くまで待つ間に (wait_spinning)、次のフレームがもう届いている。
+            // その通知の pipe は読んでしまったので、待つと次の通知まで止まる
+            0
+        } else {
+            let base = if eng.animating() { 16 } else { 1000 };
+            ui.smooth.timeout().map_or(base, |t| t.min(base))
+        };
+        let mut fds: Vec<libc::pollfd> = [0, wake_fd]
+            .into_iter()
+            .chain(ui.kbd.fds())
+            .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+            .collect();
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if fds[1].revents & libc::POLLIN != 0 {
             drain(wake_fd);
         }
+        // 端末の文字より先に読む (文字が届いたとき、そのキーがまだ押されているか分かるように)
+        read_kbd(&mut ui);
 
         let mut redraw = false;
         if let Some(p) = panes.as_ref().and_then(|rx| rx.try_iter().last()) {
@@ -352,6 +374,10 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
                 }
             }
         }
+        // スクロールの流し始め (流している間は、コマを描いたところで次の分を送る)
+        if let Some((dx, dy)) = ui.smooth.next(Instant::now(), pace.interval()) {
+            eng.scroll_by(dx, dy);
+        }
         // キー処理のあとに回す。スクロールは Servo 内のキューに積まれるだけで、
         // spin_event_loop まで処理されない (waker も呼ばれないので、先に回すと次の
         // poll のタイムアウトまで最大 1 秒待たされる)。
@@ -369,31 +395,63 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
 
         if eng.take_frame() {
             let t0 = Instant::now();
+            // Servo がこのコマを組み終えた時刻
+            let built = ready_at.take().unwrap_or(t0);
             eng.paint();
             let t1 = Instant::now();
+            // スクロールの次の分は paint のすぐあとに送り、読み出しと垂直同期を待つ間に Servo に
+            // 次のコマを組ませる (長いページでは組むのに 20ms 以上かかり、読み出しのあとに
+            // 送ると 1 コマが 33ms にも収まらない)
+            let shown_step = ui.smooth.shown();
+            // 垂直同期を待っている間にキーを離していたら、もう送らない
+            read_kbd(&mut ui);
+            if let Some((dx, dy)) = ui.smooth.next(Instant::now(), pace.interval()) {
+                eng.scroll_by(dx, dy);
+                eng.spin();
+            }
+            let t1b = Instant::now();
             let img = eng.read(std::mem::take(&mut spare));
             let t2 = Instant::now();
             if let Some(img) = img {
-                let drawn = fb.present(&img, area, None);
+                // スクロール中は、前のコマからそのコマの分の間隔をあけて出す
+                // (コマごとに 1 コマ分ずつ進めているので、出す間隔が揺れると速さも揺れて見える)
+                if let Some((sent, _)) = shown_step {
+                    let wait_servo = built.saturating_duration_since(sent) + (t1 - t0);
+                    pace.add(wait_servo.max((t1 - t0) + (t2 - t1b) + blit_took));
+                }
+                let target = match (shown_step, presented) {
+                    (Some((_, interval)), Some(p)) => Some(p + interval),
+                    _ => None,
+                };
+                if let Some(at) = fb.write_at(&img, area, target) {
+                    wait_spinning(&mut eng, wake_fd, at, &mut ready_at);
+                }
+                let drawn = fb.present(&img, area, target);
+                // 間に合わず、決めた間隔より遅れて出た分 (ログ用)
+                let late = target.map_or(Duration::ZERO, |v| drawn.vblank.saturating_duration_since(v));
                 let t3 = drawn.start;
                 last_blit = Instant::now();
+                blit_took = drawn.took;
+                presented = (shown_step.is_some() && ui.smooth.active()).then_some(drawn.vblank);
                 if let Some(old) = last.replace(img) {
                     spare = old.data;
                 }
                 // fb 転送の時間には垂直同期を待った時間を含めない
-                stats.add([t1 - t0, t2 - t1, last_blit - t3]);
+                stats.add([t1 - t0, t2 - t1b, last_blit - t3]);
                 if let Some(t) = key_at.take() {
                     stats.add_key(last_blit - t);
                     eprintln!("[key] 押してから {:.1}ms で表示", (last_blit - t).as_secs_f64() * 1000.0);
                 }
                 let d = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
                 eprintln!(
-                    "[frame] t={:.0} paint {:.1}ms read {:.1}ms vsync {:.1}ms blit {:.1}ms",
+                    "[frame] t={:.0} paint {:.1}ms read {:.1}ms vsync {:.1}ms blit {:.1}ms{}{}",
                     ms(t0),
                     d(t0, t1),
-                    d(t1, t2),
+                    d(t1b, t2),
                     d(t2, t3),
-                    d(t3, last_blit)
+                    d(t3, last_blit),
+                    shown_step.map_or(String::new(), |(_, i)| format!(" scroll {:.0}ms", i.as_secs_f64() * 1000.0)),
+                    if late > fb.period() / 2 { format!(" late +{:.0}ms", late.as_secs_f64() * 1000.0) } else { String::new() }
                 );
             }
         } else if redraw || last_blit.elapsed() >= Duration::from_secs(1) {
@@ -409,6 +467,43 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
 /// スクロールキーを押してからこれだけ経ってもフレームが来なければ、画面が変わらない
 /// キーだったとみなす (いつもは 30〜50ms で出る)。
 const KEY_STALE: Duration = Duration::from_millis(500);
+
+/// until まで、Servo のイベントループを回しながら待つ。次のフレームが届いたら、気づいた時刻を
+/// ready に残す。fb0 に書く時刻まで眠ってしまうと、スクロールを送ってから次のフレームが
+/// できるまでの時間が分からない (Servo の waker が呼ばれた時刻では代わりにならない。
+/// アニメーションのあるページではタイマーで 8ms ごとに呼ばれる)。
+fn wait_spinning(eng: &mut Engine, wake_fd: RawFd, until: Instant, ready: &mut Option<Instant>) {
+    // 回すのに時間がかかって書く時刻に遅れないよう、最後の 1ms は回さずに眠る
+    const LAST: Duration = Duration::from_millis(1);
+    loop {
+        let now = Instant::now();
+        if ready.is_none() && eng.frame_pending() {
+            *ready = Some(now);
+        }
+        let left = until.saturating_duration_since(now);
+        if left <= LAST {
+            std::thread::sleep(left);
+            return;
+        }
+        let mut fd = libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 };
+        let wait = libc::timespec { tv_sec: 0, tv_nsec: (left - LAST).as_nanos().min(999_999_999) as libc::c_long };
+        unsafe { libc::ppoll(&mut fd, 1, &wait, std::ptr::null()) };
+        if fd.revents & libc::POLLIN != 0 {
+            drain(wake_fd);
+            eng.spin();
+        }
+    }
+}
+
+/// キーボードを読み、押したまま流していたキーを離していたら止める。
+fn read_kbd(ui: &mut Ui) {
+    ui.kbd.read(Instant::now());
+    if let Some(c) = ui.smooth.held() {
+        if !ui.kbd.is_down(c) {
+            ui.smooth.release();
+        }
+    }
+}
 
 fn drain(fd: RawFd) {
     let mut b = [0u8; 64];
@@ -436,6 +531,10 @@ struct Ui {
     pending_g: bool,
     /// 入力モードでページへ送った文字数。d でその分を消す
     typed: usize,
+    /// hjkl のスクロールの残り
+    smooth: Smooth,
+    /// hjkl を押したままか (キーボードから読む)
+    kbd: Kbd,
 }
 
 enum Action {
@@ -448,7 +547,8 @@ enum Action {
 /// ノーマルモードのキーが表す操作。
 #[derive(Debug, PartialEq)]
 enum Cmd {
-    Scroll(f32, f32),
+    /// hjkl (押したキー, 1 回分の量)
+    Scroll(char, f32, f32),
     Hints,
     Top,
     Bottom,
@@ -484,10 +584,10 @@ const LINE: f32 = 60.0;
 fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
     let after_g = std::mem::take(pending_g);
     match k {
-        Key::Char('h') => Cmd::Scroll(-LINE, 0.0),
-        Key::Char('j') => Cmd::Scroll(0.0, LINE),
-        Key::Char('k') => Cmd::Scroll(0.0, -LINE),
-        Key::Char('l') => Cmd::Scroll(LINE, 0.0),
+        Key::Char('h') => Cmd::Scroll('h', -LINE, 0.0),
+        Key::Char('j') => Cmd::Scroll('j', 0.0, LINE),
+        Key::Char('k') => Cmd::Scroll('k', 0.0, -LINE),
+        Key::Char('l') => Cmd::Scroll('l', LINE, 0.0),
         Key::Char('g') if after_g => Cmd::Top,
         Key::Char('g') => {
             *pending_g = true;
@@ -678,8 +778,18 @@ fn enter_insert(ui: &mut Ui) {
 }
 
 fn run_cmd(eng: &mut Engine, ui: &mut Ui, cmd: Cmd) -> Action {
+    // hjkl 以外の操作をしたら、まだ送っていないスクロールは捨てる (gg のあとに流れ続けないように)
+    if !matches!(cmd, Cmd::Scroll(..) | Cmd::None) {
+        ui.smooth.stop();
+    }
     match cmd {
-        Cmd::Scroll(dx, dy) => eng.scroll_by(dx, dy),
+        // 押したままなら離すまで流し、すぐ離していたら 1 回分進める。キーリピートの文字は、
+        // キーボードから押したままと分かっていれば無視する (分からなければ 1 回分ずつ足す)
+        Cmd::Scroll(key, dx, dy) => match ui.kbd.press(key, Instant::now()) {
+            Press::Held => ui.smooth.hold(key, dx, dy),
+            Press::Tap | Press::Unknown => ui.smooth.add(dx, dy),
+            Press::Repeat => {}
+        },
         Cmd::Hints => {
             let (h, slot) = HintMode::new();
             eng.show_hints(slot);
@@ -746,7 +856,7 @@ mod tests {
     fn keys_follow_fbrowse() {
         let mut g = false;
         let mut cmd = |c: char| normal_cmd(&Key::Char(c), &mut g);
-        assert_eq!(cmd('j'), Cmd::Scroll(0.0, LINE));
+        assert_eq!(cmd('j'), Cmd::Scroll('j', 0.0, LINE));
         assert_eq!(cmd('b'), Cmd::Back);
         assert_eq!(cmd('t'), Cmd::NewTab);
         assert_eq!(cmd('Q'), Cmd::Quit);
@@ -758,7 +868,7 @@ mod tests {
         assert_eq!(cmd('g'), Cmd::None);
         assert_eq!(cmd('g'), Cmd::Top);
         assert_eq!(cmd('g'), Cmd::None);
-        assert_eq!(cmd('j'), Cmd::Scroll(0.0, LINE));
+        assert_eq!(cmd('j'), Cmd::Scroll('j', 0.0, LINE));
         assert_eq!(cmd('g'), Cmd::None);
         assert_eq!(cmd('G'), Cmd::Bottom);
         assert_eq!(normal_cmd(&Key::Enter, &mut g), Cmd::Page(Key::Enter));

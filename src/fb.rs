@@ -128,6 +128,11 @@ impl Fb {
         }
     }
 
+    /// 垂直帰線の間隔
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+
     fn mem(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.map, self.len) }
     }
@@ -208,6 +213,25 @@ impl Fb {
             _ => 0.0,
         };
         Some((*t, anchor, Span { y0: area.y as f64, y1: (area.y as usize + ch) as f64, speed }))
+    }
+
+    /// `present` が書き始める予定の時刻 (待たずに書けるなら None)。それまでに別のことをして
+    /// おきたいときに使う (main.rs は Servo のイベントループを回して、次のコマができた時刻を測る)。
+    pub fn write_at(&self, img: &Image, area: Rect, target: Option<Instant>) -> Option<Instant> {
+        let now = Instant::now();
+        match self.scan_span(img, area, now) {
+            Some((t, anchor, span)) => {
+                let want = target.map_or(i64::MIN, |v| refresh_after(t, anchor, v));
+                match decide(line_at(t, anchor, now), want, span, t) {
+                    Decision::Wait(line) => Some(time_at(t, anchor, line)),
+                    Decision::Write(_) => None,
+                }
+            }
+            // 割り込みを待つときは、target の半コマ前を過ぎてから最後の 1 回を待つ (wait_vsync_until)。
+            // 待てない書き込み先なら target まで
+            None if self.vsync => target.and_then(|v| v.checked_sub(self.period / 2)),
+            None => target,
+        }
     }
 
     /// 絵を area に描く。target が Some なら、その時刻の垂直帰線のあとの走査より前には出さない。

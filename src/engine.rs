@@ -243,6 +243,11 @@ impl Engine {
         self.delegate.frame_ready.replace(false)
     }
 
+    /// 新しいフレームが届いているか (フラグは下ろさない)。
+    pub fn frame_pending(&self) -> bool {
+        self.delegate.frame_ready.get()
+    }
+
     pub fn animating(&self) -> bool {
         self.view().animating()
     }
