@@ -6,6 +6,7 @@
 mod engine;
 mod fb;
 mod hints;
+mod scan;
 mod term;
 mod tmux;
 
@@ -283,6 +284,7 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     // 次のフレームを読み出す入れ物 (前の前のフレームのものを使い回す)
     let mut spare = Vec::new();
     let mut last_blit = Instant::now();
+    eprintln!("[scan] {}", fb.describe());
     // まだ画面に反映していない最初のスクロールキーを押した時刻
     let mut key_at: Option<Instant> = None;
     let mut stdin = std::io::stdin();
@@ -372,9 +374,8 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
             let img = eng.read(std::mem::take(&mut spare));
             let t2 = Instant::now();
             if let Some(img) = img {
-                fb.wait_vsync();
-                let t3 = Instant::now();
-                fb.draw(&img, area);
+                let drawn = fb.present(&img, area, None);
+                let t3 = drawn.start;
                 last_blit = Instant::now();
                 if let Some(old) = last.replace(img) {
                     spare = old.data;

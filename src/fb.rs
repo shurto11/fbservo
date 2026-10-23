@@ -3,10 +3,13 @@
 //! fb0 を mmap し、Servo から読み出した絵を行ごとにコピーする。fb0 は XRGB8888
 //! (メモリ上は B,G,R,X) なので、GL から BGRA で読んだ絵なら並べ替えずにそのまま書ける。
 //! サイズと行幅は sysfs から読む。描く場所は画面全体か、tmux ペインの矩形 (`Rect`)。
+//! 書く時刻は、画面の走査と重ならないように選ぶ (`present`、src/scan.rs)。
 
+use crate::scan::{decide, line_at, refresh_after, time_at, vblank_of, Clock, Decision, Span, Timing, FBIO_WAITFORVSYNC};
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 /// 画面上の矩形 (ピクセル)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -43,16 +46,33 @@ pub struct Fb {
     stride: usize,
     /// 垂直同期を待つか。FBSERVO_VSYNC=0 なら待たない (比べる用)。待てない書き込み先
     /// (FBSERVO_FB でファイルに描くときなど) なら、最初に失敗した時点でやめる
+    /// (ほかのプロセスが DRM を握っていて待てない (EBUSY) ときは、その間だけ待たずに書く)
     vsync: bool,
+    /// 走査のタイミング (EDID から) と、垂直帰線の時刻を測るスレッド。
+    /// どちらも使えるときだけ、走査の位置を見積もって書く
+    scan: Option<(Timing, Clock)>,
+    /// 垂直帰線の間隔
+    period: Duration,
+    /// (書いた幅, 1 行書くのにかかった最短の時間, 書いた回数)。書いている間に走査がどれだけ
+    /// 進むかの見積もりに使う。速く書けると見込むほど早く書き始めるので、最初の何回か
+    /// (mmap した所へ初めて書くときなどは遅い) は使わない
+    row_time: Option<(usize, Duration, u32)>,
+}
+
+/// `present` で絵を出した記録。
+pub struct Shown {
+    /// この絵が出る走査の前の垂直帰線の時刻 (走査の位置が分からなければ、書き始めた時刻)
+    pub vblank: Instant,
+    /// 書き始めた時刻
+    pub start: Instant,
+    /// 書くのにかかった時間
+    pub took: Duration,
 }
 
 fn read_sysfs(name: &str) -> Result<String> {
     let p = format!("/sys/class/graphics/fb0/{name}");
     Ok(std::fs::read_to_string(&p).with_context(|| format!("{p} を読めません"))?.trim().to_string())
 }
-
-/// linux/fb.h の FBIO_WAITFORVSYNC (_IOW('F', 0x20, __u32))
-const FBIO_WAITFORVSYNC: libc::c_ulong = 0x4004_4620;
 
 impl Fb {
     /// FBSERVO_FB で書き込み先を差し替えられる (動作確認用。サイズは fb0 と同じ前提)。
@@ -79,7 +99,33 @@ impl Fb {
             bail!("{path} を mmap できません: {}", std::io::Error::last_os_error());
         }
         let vsync = std::env::var("FBSERVO_VSYNC").map_or(true, |v| v != "0");
-        Ok(Fb { file, map: map.cast(), len, width, height, stride, vsync })
+        let timing = if vsync { Timing::from_edid(width, height) } else { None };
+        let scan = timing.and_then(|t| Some((t, Clock::start(file.try_clone().ok()?, t.period))));
+        let mut fb = Fb { file, map: map.cast(), len, width, height, stride, vsync, scan, period: Duration::ZERO, row_time: None };
+        fb.period = match timing {
+            Some(t) => t.period,
+            None => fb.measure_period(),
+        };
+        Ok(fb)
+    }
+
+    /// 書く時刻の決め方 (ログ用)
+    pub fn describe(&self) -> String {
+        match &self.scan {
+            Some((t, clock)) => format!(
+                "走査 {} 行 (表示 {} 行)、{:.3}ms (EDID)。{}",
+                t.vtotal,
+                t.vactive,
+                t.period.as_secs_f64() * 1000.0,
+                if clock.vblank(Instant::now()).is_some() {
+                    "走査の位置を見積もって書く"
+                } else {
+                    "帰線の時刻を測れていないので、測れるまでは割り込みを待ってから書く"
+                }
+            ),
+            None if self.vsync => "走査のタイミングが分からないので、垂直帰線の割り込みを待ってから書く".to_string(),
+            None => "垂直帰線を待たない".to_string(),
+        }
     }
 
     fn mem(&mut self) -> &mut [u8] {
@@ -109,12 +155,100 @@ impl Fb {
             return;
         }
         let arg: u32 = 0;
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), FBIO_WAITFORVSYNC, &arg) } != 0 {
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), FBIO_WAITFORVSYNC, &arg) } != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EBUSY)
+        {
             self.vsync = false;
         }
     }
 
-    /// 絵を area の左上から描く。area と画面からはみ出す分は切る。
+    /// target の時刻 (の半コマ前) を過ぎるまで垂直帰線を待つ。少なくとも 1 回は待つ。
+    /// 待てない書き込み先なら target まで眠る。
+    pub fn wait_vsync_until(&mut self, target: Instant, period: Duration) {
+        loop {
+            if !self.vsync {
+                std::thread::sleep(target.saturating_duration_since(Instant::now()));
+                return;
+            }
+            self.wait_vsync();
+            if Instant::now() + period / 2 >= target {
+                return;
+            }
+        }
+    }
+
+    /// 垂直帰線の間隔。何回か待って測る (待てない書き込み先なら 60Hz とみなす)。
+    fn measure_period(&mut self) -> Duration {
+        const DEFAULT: Duration = Duration::from_micros(16_667);
+        self.wait_vsync();
+        let mut last = Instant::now();
+        let mut d = Vec::new();
+        for _ in 0..4 {
+            self.wait_vsync();
+            let now = Instant::now();
+            d.push(now - last);
+            last = now;
+        }
+        d.sort();
+        let p = d[d.len() / 2];
+        if self.vsync && (Duration::from_millis(5)..Duration::from_millis(50)).contains(&p) {
+            p
+        } else {
+            DEFAULT
+        }
+    }
+
+    /// 走査の位置が分かるなら、(走査のタイミング, 直近の帰線の時刻, 書く範囲)。
+    fn scan_span(&self, img: &Image, area: Rect, now: Instant) -> Option<(Timing, Instant, Span)> {
+        let (t, clock) = self.scan.as_ref()?;
+        let anchor = clock.vblank(now)?;
+        let (cw, ch) = self.fit(img.w, img.h, area).filter(|&(_, ch)| ch > 0)?;
+        let speed = match self.row_time {
+            Some((w, d, n)) if w == cw && n >= 10 => d.as_secs_f64() * t.vtotal as f64 / t.period.as_secs_f64(),
+            _ => 0.0,
+        };
+        Some((*t, anchor, Span { y0: area.y as f64, y1: (area.y as usize + ch) as f64, speed }))
+    }
+
+    /// 絵を area に描く。target が Some なら、その時刻の垂直帰線のあとの走査より前には出さない。
+    /// 走査している途中の範囲に書くと上と下で別のコマが混ざる (ティアリング) ので、走査の位置が
+    /// 分かるときは、走査が範囲の外にある間に書く (src/scan.rs)。分からなければ垂直帰線を待ってから書く。
+    pub fn present(&mut self, img: &Image, area: Rect, target: Option<Instant>) -> Shown {
+        let vblank = match self.scan_span(img, area, Instant::now()) {
+            Some((t, anchor, span)) => {
+                let want = target.map_or(i64::MIN, |v| refresh_after(t, anchor, v));
+                let refresh = loop {
+                    match decide(line_at(t, anchor, Instant::now()), want, span, t) {
+                        Decision::Wait(line) => {
+                            std::thread::sleep(time_at(t, anchor, line).saturating_duration_since(Instant::now()))
+                        }
+                        Decision::Write(k) => break k,
+                    }
+                };
+                Some(vblank_of(t, anchor, refresh))
+            }
+            None => {
+                match target {
+                    Some(v) => self.wait_vsync_until(v, self.period),
+                    None => self.wait_vsync(),
+                }
+                None
+            }
+        };
+        let start = Instant::now();
+        self.draw(img, area);
+        let took = start.elapsed();
+        if let Some((cw, ch)) = self.fit(img.w, img.h, area).filter(|&(_, ch)| ch > 0) {
+            let per_row = took / ch as u32;
+            self.row_time = match self.row_time {
+                Some((w, d, n)) if w == cw => Some((w, d.min(per_row), n.saturating_add(1))),
+                _ => Some((cw, per_row, 1)),
+            };
+        }
+        Shown { vblank: vblank.unwrap_or(start), start, took }
+    }
+
+    /// 絵を area の左上から、いますぐ描く。area と画面からはみ出す分は切る。
     pub fn draw(&mut self, img: &Image, area: Rect) {
         let Some((cw, ch)) = self.fit(img.w, img.h, area) else {
             return;
@@ -169,7 +303,18 @@ mod tests {
         let stride = (width as usize + 1) * 4;
         buf.resize(stride * height as usize, 0);
         let file = File::open("/dev/null").unwrap();
-        Fb { file, map: buf.as_mut_ptr(), len: buf.len(), width, height, stride, vsync: false }
+        Fb {
+            file,
+            map: buf.as_mut_ptr(),
+            len: buf.len(),
+            width,
+            height,
+            stride,
+            vsync: false,
+            scan: None,
+            period: Duration::ZERO,
+            row_time: None,
+        }
     }
 
     #[test]
