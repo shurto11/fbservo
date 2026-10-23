@@ -14,6 +14,8 @@ libc = "0.2"
 url = "2.5"
 dpi = "0.1"
 euclid = "0.22"
+# Servo と同じ版にする (RenderingContext::gleam_gl_api が返す Gl をそのまま使うため)
+gleam = "=0.15.1"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
 # multiprocess / clipboard は使わない (クリップボードは X/Wayland 前提)
 servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit"] }

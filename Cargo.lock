@@ -1496,6 +1496,7 @@ dependencies = [
  "anyhow",
  "dpi",
  "euclid",
+ "gleam",
  "libc",
  "rustls",
  "servo",

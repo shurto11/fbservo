@@ -4,6 +4,7 @@
 //! DISPLAY が無ければ surfman が EGL surfaceless を選ぶ) に描かせて、
 //! read_to_image で RGBA を受け取る。Servo の型は Rc なので、すべて 1 スレッドで扱う。
 
+use crate::fb::{Image, Order};
 use crate::hints::{self, Hint};
 use crate::term::Key as TermKey;
 use anyhow::{anyhow, Result};
@@ -12,7 +13,7 @@ use euclid::{Point2D, Scale};
 use servo::{
     Code, ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, DeviceVector2D,
     EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, RenderingContext, RgbaImage, Scroll, Servo,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, RenderingContext, Scroll, Servo,
     ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WebViewVector,
 };
 use std::cell::{Cell, RefCell};
@@ -96,6 +97,8 @@ pub struct Engine {
     delegate: Rc<Delegate>,
     servo: Servo,
     ctx: Rc<SoftwareRenderingContext>,
+    /// GL から BGRA で読み出せるか。読めなければ RGBA (Servo の read_to_image) に切り替える
+    bgra: Cell<bool>,
     /// 今のタブが読み込みを終えたとき、入力欄にフォーカスが当たっていた (FOCUS_JS の結果)
     input_focused: Rc<Cell<bool>>,
     pub width: u32,
@@ -125,6 +128,7 @@ impl Engine {
             delegate,
             servo,
             ctx,
+            bgra: Cell::new(true),
             input_focused: Rc::default(),
             width,
             height,
@@ -239,12 +243,34 @@ impl Engine {
         self.view().paint();
     }
 
-    /// 描いた結果を画面全体ぶん RGBA (上が先頭の行) で読み出す。
-    pub fn read(&self) -> Option<RgbaImage> {
-        let rect = DeviceIntRect::from_size(DeviceIntSize::new(self.width as i32, self.height as i32));
+    /// 描いた結果を読み出す。buf は前のフレームの入れ物を使い回す (毎回数 MB 確保しないため)。
+    /// GL から fb0 と同じ並びの BGRA で直接読む。Servo の read_to_image は RGBA で読んで
+    /// 全体を複製し上下を反転するので、そのあとの並べ替えも含めて倍以上かかる。
+    pub fn read(&self, mut buf: Vec<u8>) -> Option<Image> {
+        let (w, h) = (self.width, self.height);
+        if self.bgra.get() {
+            // 描画先のフレームバッファを結び付ける (Servo の read_to_image と同じ)
+            self.ctx.prepare_for_rendering();
+            let gl = self.ctx.gleam_gl_api();
+            // WebRender が残したエラーを読み捨ててから読む (文脈が失われると出続けるので回数を限る)
+            for _ in 0..8 {
+                if gl.get_error() == gleam::gl::NO_ERROR {
+                    break;
+                }
+            }
+            buf.resize(w as usize * h as usize * 4, 0);
+            gl.read_pixels_into_buffer(0, 0, w as i32, h as i32, gleam::gl::BGRA, gleam::gl::UNSIGNED_BYTE, &mut buf);
+            if gl.get_error() == gleam::gl::NO_ERROR {
+                self.ctx.present();
+                return Some(Image { data: buf, w, h, order: Order::BgraBottomUp });
+            }
+            eprintln!("[read] GL から BGRA で読めないので RGBA で読みます");
+            self.bgra.set(false);
+        }
+        let rect = DeviceIntRect::from_size(DeviceIntSize::new(w as i32, h as i32));
         let img = self.ctx.read_to_image(rect);
         self.ctx.present();
-        img
+        img.map(|img| Image { w: img.width(), h: img.height(), data: img.into_raw(), order: Order::RgbaTopDown })
     }
 
     fn center(&self) -> WebViewPoint {

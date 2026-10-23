@@ -90,10 +90,18 @@ URL・タイトル・読み込み状態、1 フレームごとの時間は `$XDG
 Servo (DOM / Stylo / SpiderMonkey / WebRender)
    │  SoftwareRenderingContext (Mesa llvmpipe, EGL surfaceless)
    ▼
-read_to_image → RGBA (上下反転済み)
+glReadPixels で BGRA のまま読む (fb0 の XRGB8888 と同じ並び。下の行が先頭)
    ▼
-RGBA → BGRX に並べ替えて 1 行ずつ /dev/fb0 へ (stride は sysfs から)
+垂直同期を待ち、mmap した /dev/fb0 へ行を逆順にコピー (stride は sysfs から)
 ```
+
+- 読み出しは Servo の `read_to_image` を使わない。あちらは RGBA で読んで全体を複製し、
+  上下を反転するので、fb0 向けの並べ替えまで含めると倍以上かかる。
+  BGRA で読めない GL なら、自動で `read_to_image` に戻す。
+- 1 フレームの時間 (画面全体): paint 2ms、読み出し 10ms (大半は llvmpipe が描き終わるのを待つ時間)、
+  fb0 への転送 2ms。
+- 垂直同期 (`FBIO_WAITFORVSYNC`) を待ってから上の行へ書くので、書いている途中で画面が更新されて
+  絵が上下でずれる (ティアリング) ことがない。`FBSERVO_VSYNC=0` で待たなくなる (比べる用)。
 
 - Servo の型は `Rc` なので、すべて 1 スレッドで扱う。Servo が別スレッドから起こしたいときは
   `EventLoopWaker` が pipe に 1 バイト書き、メインループは標準入力とその pipe を `poll` する。
@@ -121,7 +129,7 @@ RGBA → BGRX に並べ替えて 1 行ずつ /dev/fb0 へ (stride は sysfs か�
 |---|---|
 | `src/main.rs` | 引数、メインループ、キー操作、計測 |
 | `src/engine.rs` | Servo / WebView の生成と操作、waker、delegate |
-| `src/fb.rs` | fb0 への書き込み |
+| `src/fb.rs` | fb0 への書き込み (mmap、垂直同期) |
 | `src/term.rs` | 端末の raw モード、キー列の解釈 |
 | `src/hints.rs` | リンクヒントの JS と結果の読み取り |
 | `src/tmux.rs` | tmux のペーストバッファへのコピー |

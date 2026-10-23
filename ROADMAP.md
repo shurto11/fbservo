@@ -99,7 +99,8 @@ Servo の修正 1 件 (1px 未満の箱がスクロールを吸う問題。READM
 
 ### 並行して進めるもの: 速さと安定性
 
-- 読み出しの高速化: GL から BGRA で直接読む。変わった行だけ fb0 に書く。
+- **済** 読み出しの高速化: GL から BGRA で直接読み、mmap した fb0 へコピーする。垂直同期を待つ。
+  残り: 変わった行だけ fb0 に書く。
 - Servo が落ちたとき (`notify_crashed`) に、理由を出して再読み込みできるようにする。
 - Servo の版上げ。上げるたびに `vendor/servo-paint` のパッチがまだ要るかを
   `testpages/subpixel-overflow.html` で確かめる。

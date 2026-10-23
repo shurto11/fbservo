@@ -11,7 +11,7 @@ mod tmux;
 
 use anyhow::{Context, Result};
 use engine::Engine;
-use fb::Fb;
+use fb::{Fb, Image};
 use hints::HintMode;
 use std::io::Read;
 use std::os::fd::{AsRawFd, RawFd};
@@ -249,6 +249,8 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
     let mode = if first.is_some() { Mode::Normal } else { Mode::Prompt(Open::Here, String::new()) };
     let mut ui = Ui { mode, pending_g: false, typed: 0 };
     let url = first.unwrap_or_else(|| Url::parse("about:blank").unwrap());
+    // 描く場所 (画面全体)
+    let area = fb.full();
     eprintln!("[start] {url} ({}x{}, scale {scale})", fb.width, fb.height);
 
     let _raw = RawMode::enter();
@@ -258,7 +260,9 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
     }
 
     // 最後に描いたフレーム。端末 (tmux の時計など) に上書きされても描き直せるよう取っておく。
-    let mut last: Option<(Vec<u8>, u32, u32)> = None;
+    let mut last: Option<Image> = None;
+    // 次のフレームを読み出す入れ物 (前の前のフレームのものを使い回す)
+    let mut spare = Vec::new();
     let mut last_blit = Instant::now();
     // まだ画面に反映していない最初のスクロールキーを押した時刻
     let mut key_at: Option<Instant> = None;
@@ -297,7 +301,7 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
                     Action::None => {}
                     Action::Redraw => redraw = true,
                     Action::Quit => {
-                        fb.clear();
+                        fb.clear(area);
                         return Ok(());
                     }
                 }
@@ -321,29 +325,35 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
             let t0 = Instant::now();
             eng.paint();
             let t1 = Instant::now();
-            let img = eng.read();
+            let img = eng.read(std::mem::take(&mut spare));
             let t2 = Instant::now();
             if let Some(img) = img {
-                let (w, h) = img.dimensions();
-                fb.blit(img.as_raw(), w, h, 0, 0);
-                last = Some((img.into_raw(), w, h));
+                fb.wait_vsync();
+                let t3 = Instant::now();
+                fb.draw(&img, area);
                 last_blit = Instant::now();
-                stats.add([t1 - t0, t2 - t1, last_blit - t2]);
+                if let Some(old) = last.replace(img) {
+                    spare = old.data;
+                }
+                // fb 転送の時間には垂直同期を待った時間を含めない
+                stats.add([t1 - t0, t2 - t1, last_blit - t3]);
                 if let Some(t) = key_at.take() {
                     stats.add_key(last_blit - t);
                     eprintln!("[key] 押してから {:.1}ms で表示", (last_blit - t).as_secs_f64() * 1000.0);
                 }
+                let d = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
                 eprintln!(
-                    "[frame] t={:.0} paint {:.1}ms read {:.1}ms blit {:.1}ms",
+                    "[frame] t={:.0} paint {:.1}ms read {:.1}ms vsync {:.1}ms blit {:.1}ms",
                     ms(t0),
-                    (t1 - t0).as_secs_f64() * 1000.0,
-                    (t2 - t1).as_secs_f64() * 1000.0,
-                    (last_blit - t2).as_secs_f64() * 1000.0
+                    d(t0, t1),
+                    d(t1, t2),
+                    d(t2, t3),
+                    d(t3, last_blit)
                 );
             }
         } else if redraw || last_blit.elapsed() >= Duration::from_secs(1) {
-            if let Some((px, w, h)) = &last {
-                fb.blit(px, *w, *h, 0, 0);
+            if let Some(img) = &last {
+                fb.draw(img, area);
             }
             last_blit = Instant::now();
         }
