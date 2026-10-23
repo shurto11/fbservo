@@ -224,6 +224,15 @@ impl Engine {
         true
     }
 
+    /// 描画領域の大きさを変える (tmux のペインの大きさが変わったとき)。タブはすべて同じ
+    /// 描画コンテキストを使うので、1 回で全タブが新しい大きさになる。
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        self.view().resize(PhysicalSize::new(width, height));
+        self.delegate.frame_ready.set(true);
+    }
+
     /// 変化が無くても次のループで描き直させる。
     pub fn request_frame(&self) {
         self.delegate.frame_ready.set(true);

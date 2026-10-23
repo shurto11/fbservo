@@ -11,7 +11,7 @@ mod tmux;
 
 use anyhow::{Context, Result};
 use engine::Engine;
-use fb::{Fb, Image};
+use fb::{Fb, Image, Rect};
 use hints::HintMode;
 use std::io::Read;
 use std::os::fd::{AsRawFd, RawFd};
@@ -21,7 +21,10 @@ use term::{Key, RawMode};
 use url::Url;
 
 const USAGE: &str = "\
-使い方: fbservo [--scale N] [URL | ファイル | 検索語]
+使い方: fbservo [--full] [--scale N] [URL | ファイル | 検索語]
+
+tmux の中では自分のペインに描き、ペインの移動・大きさの変化・ウィンドウの切り替えに
+ついていく (fbrowse の --auto と同じ)。--full を付けると画面全体に描く。
 
 キー (fbrowse と同じ配置):
   hjkl          スクロール            gg / G       先頭 / 末尾
@@ -197,6 +200,7 @@ fn say(msg: &str) {
 
 fn main() {
     let mut scale = 1.0f32;
+    let mut full = false;
     let mut target = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -206,6 +210,9 @@ fn main() {
                 return;
             }
             "--scale" => scale = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0),
+            "--full" => full = true,
+            // fbrowse と同じ指定でも起動できるように受け付ける (tmux の中ならもともとペインを追う)
+            "--auto" => full = false,
             _ => target = Some(target.map_or(a.clone(), |t: String| format!("{t} {a}"))),
         }
     }
@@ -228,7 +235,7 @@ fn main() {
     }
 
     let mut stats = Stats::default();
-    let result = run(&mut fb, target.as_deref(), scale, &mut stats);
+    let result = run(&mut fb, target.as_deref(), scale, full, &mut stats);
 
     unsafe { libc::dup2(orig_stderr, 2) };
     print!("\x1b[2J\x1b[H");
@@ -243,18 +250,30 @@ fn main() {
     }
 }
 
-fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Result<()> {
+fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut Stats) -> Result<()> {
     let (wake_fd, waker) = engine::pipe_waker()?;
     let first = target.and_then(resolve);
     let mode = if first.is_some() { Mode::Normal } else { Mode::Prompt(Open::Here, String::new()) };
     let mut ui = Ui { mode, pending_g: false, typed: 0 };
     let url = first.unwrap_or_else(|| Url::parse("about:blank").unwrap());
-    // 描く場所 (画面全体)
-    let area = fb.full();
-    eprintln!("[start] {url} ({}x{}, scale {scale})", fb.width, fb.height);
+
+    // tmux の中なら自分のペインに描き、ペインが動いたり隠れたりしたら追いかける
+    let follow = !full && tmux::inside();
+    let pane = if follow { tmux::pane(fb.width, fb.height) } else { None };
+    if follow && pane.is_none() {
+        eprintln!("[pane] ペインの位置が分からないので画面全体に描きます");
+    }
+    // 描く場所と、そこがいま画面に出ているか
+    let mut area = pane.as_ref().map_or(fb.full(), |p| p.rect);
+    let mut shown = pane.as_ref().is_none_or(|p| p.shown);
+    let panes = follow.then(|| {
+        let w = waker.clone_box();
+        tmux::follow(fb.width, fb.height, move || w.wake())
+    });
+    eprintln!("[start] {url} ({}x{} at {},{}, scale {scale})", area.w, area.h, area.x, area.y);
 
     let _raw = RawMode::enter();
-    let mut eng = Engine::new(fb.width, fb.height, scale, url, waker)?;
+    let mut eng = Engine::new(area.w, area.h, scale, url, waker)?;
     if let Mode::Prompt(open, buf) = &ui.mode {
         show_prompt(*open, buf);
     }
@@ -272,7 +291,7 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
     let ms = |t: Instant| (t - start).as_secs_f64() * 1000.0;
 
     loop {
-        let timeout = if eng.animating() { 16 } else { 1000 };
+        let timeout = if shown && eng.animating() { 16 } else { 1000 };
         let mut fds = [
             libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
@@ -283,6 +302,27 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
         }
 
         let mut redraw = false;
+        if let Some(p) = panes.as_ref().and_then(|rx| rx.try_iter().last()) {
+            if p.rect != area {
+                eprintln!("[pane] {}x{} at {},{}", p.rect.w, p.rect.h, p.rect.x, p.rect.y);
+                let inside = |a: Rect, b: Rect| a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h;
+                let old = std::mem::replace(&mut area, p.rect);
+                eng.resize(area.w, area.h);
+                // 前の大きさの絵はもう描かない
+                last = None;
+                if !inside(old, area) {
+                    // 縮んだり動いたりした跡は隣のペインのものになった。気づくまでの間に
+                    // 上書きしてしまった分を、tmux に端末の文字で描き直してもらう
+                    tmux::refresh_clients();
+                }
+            }
+            if p.shown != shown {
+                shown = p.shown;
+                eprintln!("[pane] {}", if shown { "表示" } else { "非表示 (描画を止める)" });
+                // ウィンドウを切り替えて戻ってきたら、tmux が描いた端末の文字の上にすぐ描き直す
+                redraw = shown;
+            }
+        }
         if fds[0].revents & libc::POLLIN != 0 {
             let n = stdin.read(&mut buf).context("標準入力を読めません")?;
             if n == 0 {
@@ -302,6 +342,9 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
                     Action::Redraw => redraw = true,
                     Action::Quit => {
                         fb.clear(area);
+                        if follow {
+                            tmux::refresh_clients();
+                        }
                         return Ok(());
                     }
                 }
@@ -317,7 +360,8 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, stats: &mut Stats) -> Resu
         if eng.take_input_focused() && matches!(ui.mode, Mode::Normal) {
             enter_insert(&mut ui);
         }
-        if ui.mode.uses_terminal() {
+        // 隠れている間は描かない。届いたフレームは表示に戻ったときに描く
+        if ui.mode.uses_terminal() || !shown {
             continue;
         }
 

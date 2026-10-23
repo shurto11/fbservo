@@ -9,7 +9,7 @@
 JavaScript は Servo 内蔵の SpiderMonkey が動かす。
 
 いまは「Servo で普段のサイトがどこまで見られるか・どれくらい速いか」を測るための試作で、
-fb-server 連携、tmux ペイン追従、リンクヒント、動画再生は無い。
+fb-server 連携、動画再生、絵の中のステータス行はまだ無い。
 fbrowse に追いつくまでの順番は [ROADMAP.md](ROADMAP.md) にまとめてある。
 
 ## 必要なもの
@@ -29,7 +29,18 @@ cargo build --release      # 初回は依存 (Servo 一式・約 800 crate) の�
 ./target/release/fbservo rust 言語           # 検索語は DuckDuckGo で検索
 ./target/release/fbservo                     # 起動してすぐ URL を入力
 ./target/release/fbservo --scale 1.25 URL    # HiDPI 倍率
+./target/release/fbservo --full URL          # tmux の中でも画面全体に描く
 ```
+
+tmux の中で起動すると、自分のペインに描く (fbrowse の `--auto` と同じ。`--auto` も受け付ける)。
+
+- ペインの移動や大きさの変化 (分割、`resize-pane` など) は 500ms ごとに調べて追いかけ、
+  ページもその大きさで組み直す。
+- 別のウィンドウやセッションに切り替えたとき、同じウィンドウの別のペインがズームされたときは描くのを止め、
+  戻ったらすぐ描き直す。
+- ペインが縮んだり動いたりしたときと終了したときは、`tmux refresh-client` で自分の絵の跡を
+  端末の文字に描き直してもらう。
+- セルの大きさは、画面の大きさを tmux クライアントの行数・列数で割って求める (fbrowse と同じ)。
 
 `.cargo/config.toml` で並列数を 2 に抑え、リンクには lld を使っている
 (メモリ 3.7GB のマシンでもビルドできるように)。
@@ -107,6 +118,8 @@ glReadPixels で BGRA のまま読む (fb0 の XRGB8888 と同じ並び。下の
   `EventLoopWaker` が pipe に 1 バイト書き、メインループは標準入力とその pipe を `poll` する。
 - `notify_new_frame_ready` が来たら `paint` → `read_to_image` → `present` → fb0 に書く。
 - 端末 (tmux の時計など) に上書きされても戻るよう、変化が無くても 1 秒ごとに直前のフレームを描き直す。
+- tmux のペイン追従は別スレッドで `tmux display-message` を 500ms ごとに呼び、変わったときだけ
+  メインループに渡す (tmux の起動を待つ数 ms でキー入力を止めないため)。
 - 書き込み先は `FBSERVO_FB` で差し替えられる (動作確認用。サイズは fb0 と同じ前提)。
 
 ## Servo への修正 (`vendor/servo-paint`)
@@ -132,6 +145,6 @@ glReadPixels で BGRA のまま読む (fb0 の XRGB8888 と同じ並び。下の
 | `src/fb.rs` | fb0 への書き込み (mmap、垂直同期) |
 | `src/term.rs` | 端末の raw モード、キー列の解釈 |
 | `src/hints.rs` | リンクヒントの JS と結果の読み取り |
-| `src/tmux.rs` | tmux のペーストバッファへのコピー |
+| `src/tmux.rs` | tmux のペインの位置の追従、ペーストバッファへのコピー |
 | `vendor/servo-paint/` | 上の修正を入れた servo-paint 0.7.0 (MPL-2.0) |
 | `testpages/subpixel-overflow.html` | その修正の確認用ページ |
