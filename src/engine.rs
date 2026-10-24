@@ -9,7 +9,7 @@ use crate::hints::{self, Hint};
 use crate::term::Key as TermKey;
 use anyhow::{anyhow, Result};
 use dpi::PhysicalSize;
-use euclid::{Point2D, Scale};
+use euclid::Point2D;
 use servo::{
     Code, ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, DeviceVector2D,
     EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
@@ -103,11 +103,10 @@ pub struct Engine {
     input_focused: Rc<Cell<bool>>,
     pub width: u32,
     pub height: u32,
-    scale: f32,
 }
 
 impl Engine {
-    pub fn new(width: u32, height: u32, scale: f32, url: Url, waker: Box<dyn EventLoopWaker>) -> Result<Engine> {
+    pub fn new(width: u32, height: u32, url: Url, waker: Box<dyn EventLoopWaker>) -> Result<Engine> {
         let ctx = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize::new(width, height))
                 .map_err(|e| anyhow!("ソフトウェア GL を初期化できません: {e:?}"))?,
@@ -118,7 +117,6 @@ impl Engine {
         let delegate = Rc::new(Delegate::default());
         let view = WebViewBuilder::new(&servo, ctx.clone())
             .url(url)
-            .hidpi_scale_factor(Scale::new(scale))
             .delegate(delegate.clone())
             .build();
         view.set_focused(true);
@@ -132,7 +130,6 @@ impl Engine {
             input_focused: Rc::default(),
             width,
             height,
-            scale,
         })
     }
 
@@ -155,7 +152,6 @@ impl Engine {
         if let Some(req) = req {
             let view = req
                 .builder(self.ctx.clone())
-                .hidpi_scale_factor(Scale::new(self.scale))
                 .delegate(self.delegate.clone())
                 .build();
             self.add_tab(view);
@@ -180,7 +176,6 @@ impl Engine {
     pub fn open_tab(&mut self, url: Url) {
         let view = WebViewBuilder::new(&self.servo, self.ctx.clone())
             .url(url)
-            .hidpi_scale_factor(Scale::new(self.scale))
             .delegate(self.delegate.clone())
             .build();
         self.add_tab(view);

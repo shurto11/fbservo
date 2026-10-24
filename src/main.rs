@@ -2,7 +2,7 @@
 //! その共有メモリ) へ直接書く試作。
 //!
 //! 動作中は端末に何も出さない (出すとページの絵を上書きする)。ログは
-//! $XDG_RUNTIME_DIR/fbservo.log に書き、終了時にフレーム時間とメモリの集計を表示する。
+//! $XDG_RUNTIME_DIR/fbservo.log に書き、終了時にそのパスを表示する。
 
 mod drmterm;
 mod engine;
@@ -28,7 +28,7 @@ use term::{Key, RawMode};
 use url::Url;
 
 const USAGE: &str = "\
-使い方: fbservo [--full] [--scale N] [URL | ファイル | 検索語]
+使い方: fbservo [--full] [URL | ファイル | 検索語]
 
 tmux の中では自分のペインに描き、ペインの移動・大きさの変化・ウィンドウの切り替えに
 ついていく (fbrowse の --auto と同じ)。--full を付けると画面全体に描く。
@@ -39,7 +39,6 @@ drmterm の中では、drmterm の画面のペインに描く (--full でもペ�
   f             リンクヒント (ラベルの 2 文字でクリック。f / Esc で取消)
                 入力欄を選ぶとそのまま入力 (Enter で確定、Esc で戻る)
                 開いたページの入力欄にフォーカスがあれば、選ばなくても入力
-  d             直前の入力を削除
   b / r         戻る / 再読込         Enter/Space  そのままページへ送る (矢印も)
   + - 0         ズームイン / アウト / リセット
   t             新しいタブ            ] / [        次 / 前のタブ
@@ -96,67 +95,6 @@ fn resolve(input: &str) -> Option<Url> {
     Url::parse(&format!("https://duckduckgo.com/?q={}", encode_component(input))).ok()
 }
 
-/// 1 フレームを fb0 に出すまでの各段階の時間。
-#[derive(Default)]
-struct Stats {
-    frames: u32,
-    sum: [Duration; 3],
-    max: [Duration; 3],
-    /// スクロールキーを押してから、その結果が fb0 に出るまで
-    keys: u32,
-    key_sum: Duration,
-    key_max: Duration,
-}
-
-impl Stats {
-    // 全角文字があると {:<N} では揃わないので、表示幅 9 に合わせて空白を入れておく
-    const NAMES: [&'static str; 3] = ["paint    ", "readback ", "fb 転送  "];
-
-    fn add(&mut self, t: [Duration; 3]) {
-        self.frames += 1;
-        for i in 0..3 {
-            self.sum[i] += t[i];
-            self.max[i] = self.max[i].max(t[i]);
-        }
-    }
-
-    fn add_key(&mut self, d: Duration) {
-        self.keys += 1;
-        self.key_sum += d;
-        self.key_max = self.key_max.max(d);
-    }
-
-    fn summary(&self) -> String {
-        let mut s = format!("フレーム数: {}\n", self.frames);
-        if self.frames == 0 {
-            return s;
-        }
-        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        for i in 0..3 {
-            let avg = self.sum[i] / self.frames;
-            s += &format!("  {} 平均 {:6.1} ms  最大 {:6.1} ms\n", Self::NAMES[i], ms(avg), ms(self.max[i]));
-        }
-        let total: Duration = self.sum.iter().sum::<Duration>() / self.frames;
-        s += &format!("  合計      平均 {:6.1} ms\n", ms(total));
-        if self.keys > 0 {
-            s += &format!(
-                "キー→画面 平均 {:6.1} ms  最大 {:6.1} ms ({} 回)\n",
-                ms(self.key_sum / self.keys),
-                ms(self.key_max),
-                self.keys
-            );
-        }
-        s
-    }
-}
-
-/// 最大常駐メモリ (MB)。
-fn max_rss_mb() -> u64 {
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    ru.ru_maxrss as u64 / 1024
-}
-
 fn log_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     Path::new(&dir).join("fbservo.log")
@@ -206,7 +144,6 @@ fn say(msg: &str) {
 }
 
 fn main() {
-    let mut scale = 1.0f32;
     let mut full = false;
     let mut target = None;
     let mut args = std::env::args().skip(1);
@@ -216,7 +153,6 @@ fn main() {
                 println!("{USAGE}");
                 return;
             }
-            "--scale" => scale = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0),
             "--full" => full = true,
             // fbrowse と同じ指定でも起動できるように受け付ける (tmux の中ならもともとペインを追う)
             "--auto" => full = false,
@@ -241,27 +177,24 @@ fn main() {
         unsafe { libc::dup2(f.as_raw_fd(), 2) };
     }
 
-    let mut stats = Stats::default();
-    let result = run(&mut fb, target.as_deref(), scale, full, &mut stats);
+    let result = run(&mut fb, target.as_deref(), full);
 
     unsafe { libc::dup2(orig_stderr, 2) };
     print!("\x1b[2J\x1b[H");
     if let Err(e) = &result {
         eprintln!("エラー: {e:#}");
     }
-    print!("{}", stats.summary());
-    println!("最大メモリ (RSS): {} MB", max_rss_mb());
     println!("ログ: {}", log.display());
     if result.is_err() {
         std::process::exit(1);
     }
 }
 
-fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut Stats) -> Result<()> {
+fn run(fb: &mut Fb, target: Option<&str>, full: bool) -> Result<()> {
     let (wake_fd, waker) = engine::pipe_waker()?;
     let first = target.and_then(resolve);
     let mode = if first.is_some() { Mode::Normal } else { Mode::Prompt(Open::Here, String::new()) };
-    let mut ui = Ui { mode, pending_g: false, typed: 0, smooth: Smooth::default(), kbd: Kbd::open() };
+    let mut ui = Ui { mode, pending_g: false, smooth: Smooth::default(), kbd: Kbd::open() };
     if let Some(s) = fb.drmterm_keys() {
         ui.kbd.add_drmterm(s);
     }
@@ -308,10 +241,10 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     let cell_h = term.as_ref().map_or(0, |t| t.cell.1);
     // 一度でも描いたか (それまでは drmterm の共有メモリに前のクライアントの絵が残っている)
     let mut drawn = false;
-    eprintln!("[start] {url} ({}x{} at {},{}, scale {scale})", area.w, area.h, area.x, area.y);
+    eprintln!("[start] {url} ({}x{} at {},{})", area.w, area.h, area.x, area.y);
 
     let _raw = RawMode::enter();
-    let mut eng = Engine::new(area.w, area.h, scale, url, waker)?;
+    let mut eng = Engine::new(area.w, area.h, url, waker)?;
     if let Mode::Prompt(open, buf) = &ui.mode {
         show_prompt(*open, buf);
     }
@@ -475,10 +408,7 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
                 if let Some(old) = last.replace(img) {
                     spare = old.data;
                 }
-                // fb 転送の時間には垂直同期を待った時間を含めない
-                stats.add([t1 - t0, t2 - t1b, last_blit - t3]);
                 if let Some(t) = key_at.take() {
-                    stats.add_key(last_blit - t);
                     eprintln!("[key] 押してから {:.1}ms で表示", (last_blit - t).as_secs_f64() * 1000.0);
                 }
                 let d = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
@@ -593,8 +523,6 @@ struct Ui {
     mode: Mode,
     /// g を 1 回押して、次の g を待っている (gg で先頭)
     pending_g: bool,
-    /// 入力モードでページへ送った文字数。d でその分を消す
-    typed: usize,
     /// hjkl のスクロールの残り
     smooth: Smooth,
     /// hjkl を押したままか (キーボードから読む)
@@ -621,7 +549,6 @@ enum Cmd {
     Back,
     Forward,
     Reload,
-    DeleteTyped,
     NewTab,
     EditUrl,
     /// 次 (1) / 前 (-1) のタブ
@@ -670,7 +597,6 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
         Key::Char('b') => Cmd::Back,
         Key::Char('L') => Cmd::Forward,
         Key::Char('r') => Cmd::Reload,
-        Key::Char('d') => Cmd::DeleteTyped,
         Key::Char('t') => Cmd::NewTab,
         Key::Char('O') => Cmd::EditUrl,
         Key::Char(']') => Cmd::Tab(1),
@@ -687,6 +613,7 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
         Key::Char('o') => Cmd::NotYet("お気に入りに追加", "2-4"),
         Key::Char('p') => Cmd::NotYet("クリップボード表示", "2-6"),
         Key::Char('T') => Cmd::NotYet("タブを別ペインへ移す", "3-2"),
+        Key::Char('d') => Cmd::NotNeeded("直前の入力の削除 (入力モードの Backspace で消す)"),
         Key::Char('s') => Cmd::NotNeeded("撮り直し (絵は自分で描き直す。崩れたら r で読み直す)"),
         Key::Char('c' | 'C') => Cmd::NotNeeded("動画モード (fbservo は常に動く絵を描いている)"),
         Key::Char('M' | 'P') => Cmd::NotNeeded("mpv で再生 (動画は見ない)"),
@@ -721,8 +648,6 @@ fn handle_key(eng: &mut Engine, ui: &mut Ui, k: Key) -> Action {
                     say("入力モード終了 (Enter)");
                     return Action::None;
                 }
-                Key::Char(_) => ui.typed += 1,
-                Key::Backspace => ui.typed = ui.typed.saturating_sub(1),
                 _ => {}
             }
             eng.send_key(&k);
@@ -836,7 +761,6 @@ fn finish_hint(eng: &Engine, ui: &mut Ui) {
 /// 当てていたとき。
 fn enter_insert(ui: &mut Ui) {
     ui.mode = Mode::Insert;
-    ui.typed = 0;
     say("入力モード (Enter で確定、Esc で戻る)");
 }
 
@@ -864,12 +788,6 @@ fn run_cmd(eng: &mut Engine, ui: &mut Ui, cmd: Cmd) -> Action {
         Cmd::Back => eng.back(),
         Cmd::Forward => eng.forward(),
         Cmd::Reload => eng.reload(),
-        Cmd::DeleteTyped => {
-            say(&format!("入力削除 ({} 文字)", ui.typed));
-            for _ in 0..std::mem::take(&mut ui.typed) {
-                eng.send_key(&Key::Backspace);
-            }
-        }
         Cmd::NewTab | Cmd::EditUrl => {
             let (open, init) = if cmd == Cmd::NewTab {
                 (Open::NewTab, String::new())
