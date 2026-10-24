@@ -45,7 +45,7 @@ tmux の中では自分のペインに描き、ペインの移動・大きさの
 fbservo だけのキー:
   L             進む                  O            今の URL を編集して開く
 まだ無いもの (ROADMAP.md): m カーソル, o お気に入り, p クリップボード,
-  T タブを別ペインへ, M/P mpv";
+  T タブを別ペインへ";
 
 /// "example.com/path" のようにドメインらしく見えるか (fbrowse と同じ判定)。
 fn looks_like_domain(s: &str) -> bool {
@@ -197,8 +197,7 @@ fn show_prompt(open: Open, buf: &str) {
     term::bottom_line(&format!("{label}: {buf}"));
 }
 
-/// 操作の結果をログに残す。
-/// TODO(ROADMAP 1-4): 絵の中のステータス行にも出す (ペインに描いている間は端末が見えない)
+/// 操作の結果をログに残す (絵には何も重ねない。ROADMAP.md の「作らないもの」)。
 fn say(msg: &str) {
     eprintln!("[ui] {msg}");
 }
@@ -621,12 +620,12 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
         Key::Char('?') => Cmd::Help,
         Key::Char('Q') => Cmd::Quit,
         Key::Char('f') => Cmd::Hints,
-        Key::Char('m') => Cmd::NotYet("カーソルモード", "3-2"),
+        Key::Char('m') => Cmd::NotYet("カーソルモード", "4-1"),
         Key::Char('o') => Cmd::NotYet("お気に入りに追加", "2-4"),
-        Key::Char('p') => Cmd::NotYet("クリップボード表示", "3-4"),
-        Key::Char('T') => Cmd::NotYet("タブを別ペインへ移す", "3-8"),
-        Key::Char('M' | 'P') => Cmd::NotYet("mpv で再生", "4-1"),
+        Key::Char('p') => Cmd::NotYet("クリップボード表示", "2-6"),
+        Key::Char('T') => Cmd::NotYet("タブを別ペインへ移す", "3-2"),
         Key::Char('c' | 'C') => Cmd::NotNeeded("動画モード (fbservo は常に動く絵を描いている)"),
+        Key::Char('M' | 'P') => Cmd::NotNeeded("mpv で再生 (動画は見ない)"),
         Key::Char('i') => Cmd::NotNeeded("入力モード (f で入力欄を選ぶと入る)"),
         _ => Cmd::None,
     }
