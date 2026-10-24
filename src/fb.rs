@@ -14,6 +14,7 @@ use crate::scan::{decide, line_at, refresh_after, time_at, vblank_of, Clock, Dec
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::time::{Duration, Instant};
 
 /// 画面上の矩形 (ピクセル)
@@ -66,6 +67,9 @@ pub struct Fb {
     row_time: Option<(usize, Duration, u32)>,
     /// drmterm へ書いているときの接続
     drm: Option<Overlay>,
+    /// 書き込み先が本物のフレームバッファ (内蔵画面そのもの) か。FBSERVO_FB でファイルへ
+    /// 描いているときと drmterm へ書いているときは偽
+    console: bool,
 }
 
 /// `present` で絵を出した記録。
@@ -113,12 +117,13 @@ impl Fb {
             .write(true)
             .open(&path)
             .with_context(|| format!("{path} を開けません (video グループに入っていますか)"))?;
+        let console = file.metadata().is_ok_and(|m| m.file_type().is_char_device());
         let len = stride * height as usize;
         let map = mmap(&file, len, &path)?;
         let vsync = std::env::var("FBSERVO_VSYNC").map_or(true, |v| v != "0");
         let timing = if vsync { Timing::from_edid(width, height) } else { None };
         let scan = timing.and_then(|t| Some((t, Clock::start(file.try_clone().ok()?, t.period))));
-        let mut fb = Fb { file, map, len, width, height, stride, vsync, scan, period: Duration::ZERO, crtc: None, row_time: None, drm: None };
+        let mut fb = Fb { file, map, len, width, height, stride, vsync, scan, period: Duration::ZERO, crtc: None, row_time: None, drm: None, console };
         fb.period = match timing {
             Some(t) => t.period,
             None => fb.measure_period(),
@@ -151,7 +156,13 @@ impl Fb {
             crtc: crtc.map(|(_, c)| c),
             row_time: None,
             drm: Some(ov),
+            console: false,
         })
+    }
+
+    /// 書き込み先が本物のフレームバッファ (内蔵画面そのもの) か
+    pub fn is_console(&self) -> bool {
+        self.console
     }
 
     /// drmterm へ書いているなら、その情報
@@ -448,6 +459,7 @@ mod tests {
             crtc: None,
             row_time: None,
             drm: None,
+            console: false,
         }
     }
 

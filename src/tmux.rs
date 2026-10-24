@@ -53,6 +53,46 @@ pub fn shows_session(tty: &str, session: &str) -> bool {
     out.lines().any(|l| l.split_once('\t') == Some((tty, session)))
 }
 
+/// pid のプロセスが内蔵画面の端末で動いているか。fbterm の子孫か、コンソール (/dev/ttyN) にいれば真。
+/// tmux のサーバはデーモンになって fbterm から切り離されるので、ペインの中のプロセスはこれでは
+/// 決まらない (そのペインを映している tmux クライアントで決める、`console_client`)。
+pub fn on_console(pid: u32, tty: &str) -> bool {
+    let vt = tty.strip_prefix("/dev/tty").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    vt || ancestors(pid).iter().any(|comm| comm == "fbterm")
+}
+
+/// pid から init の手前までの、各プロセスの名前
+fn ancestors(mut pid: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    // 輪になることはないが、念のため打ち切る
+    while pid > 1 && names.len() < 64 {
+        let (Ok(comm), Ok(stat)) =
+            (std::fs::read_to_string(format!("/proc/{pid}/comm")), std::fs::read_to_string(format!("/proc/{pid}/stat")))
+        else {
+            break;
+        };
+        names.push(comm.trim_end().to_string());
+        let Some(ppid) = parent_of(&stat) else { break };
+        pid = ppid;
+    }
+    names
+}
+
+/// /proc/<pid>/stat の親の pid。名前 (括弧の中) に空白や括弧が入っていても読めるよう、最後の ')' の後ろから読む
+fn parent_of(stat: &str) -> Option<u32> {
+    stat.get(stat.rfind(')')? + 1..)?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// 内蔵画面に映っている tmux クライアント (fbterm の中か、コンソールで動いているもの) の tty。
+/// この tmux サーバにつながっていなければ None
+pub fn console_client() -> Option<String> {
+    let out = run(&["list-clients", "-F", "#{client_pid}\t#{client_tty}"])?;
+    out.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .find(|(pid, tty)| pid.parse().is_ok_and(|p| on_console(p, tty)))
+        .map(|(_, tty)| tty.to_string())
+}
+
 /// 文字列を tmux のペーストバッファへ入れる (prefix+] で貼り付けられる)。
 /// `-w` で set-clipboard 経由のシステムクリップボード (OSC 52) にも送る。
 pub fn copy_buffer(text: &str) -> bool {
@@ -93,12 +133,22 @@ pub struct Term {
 /// 自分のペイン ($TMUX_PANE) の位置をピクセルで返す。tmux の外や、問い合わせに
 /// 失敗したときは None。セルの大きさは、drmterm に映っていればその値を使い、
 /// そうでなければ画面の大きさを端末の行数・列数で割って求める。
-pub fn pane(fb_w: u32, fb_h: u32, term: Option<&Term>) -> Option<Pane> {
+/// console なら (/dev/fb0 へ描くとき)、内蔵画面に映っているクライアントから見る。そのクライアントが
+/// いなければ (別の tmux サーバや ssh のペイン)、どこかに映っていても内蔵画面には映っていないので隠れているとする。
+pub fn pane(fb_w: u32, fb_h: u32, term: Option<&Term>, console: bool) -> Option<Pane> {
     let fmt = "#{window_active},#{pane_left},#{pane_top},#{pane_width},#{pane_height},\
                #{window_width},#{window_height},#{client_width},#{client_height},#{status-position},\
                #{session_attached},#{window_zoomed_flag},#{pane_active},#{client_session},#{session_name}";
-    let client = term.and_then(|t| t.client.clone());
-    parse_pane(&display(fmt, client.as_deref())?, fb_w, fb_h, term.map(|t| t.cell), client.is_some())
+    let client = match term {
+        Some(t) => t.client.clone(),
+        None if console => console_client(),
+        None => None,
+    };
+    let mut p = parse_pane(&display(fmt, client.as_deref())?, fb_w, fb_h, term.map(|t| t.cell), client.is_some())?;
+    if console && term.is_none() && client.is_none() {
+        p.shown = false;
+    }
+    Some(p)
 }
 
 /// own_client: 値が drmterm 上のクライアントから見たものか (そのクライアントが自分の
@@ -143,12 +193,12 @@ fn parse_pane(out: &str, fb_w: u32, fb_h: u32, cell: Option<(u32, u32)>, own_cli
 
 /// 別スレッドで 500ms ごとに自分のペインを調べ、変わったら送って wake を呼ぶ
 /// (tmux の起動に数 ms かかるので、メインループでは待たない)。
-pub fn follow(fb_w: u32, fb_h: u32, term: Option<Term>, wake: impl Fn() + Send + 'static) -> Receiver<Pane> {
+pub fn follow(fb_w: u32, fb_h: u32, term: Option<Term>, console: bool, wake: impl Fn() + Send + 'static) -> Receiver<Pane> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut last = None;
         loop {
-            if let Some(p) = pane(fb_w, fb_h, term.as_ref()) {
+            if let Some(p) = pane(fb_w, fb_h, term.as_ref(), console) {
                 if last.as_ref() != Some(&p) {
                     if tx.send(p.clone()).is_err() {
                         return;
@@ -191,6 +241,23 @@ mod tests {
         assert!(p.shown);
         // drmterm のクライアントが別のセッションを映している
         assert!(!parse_pane(&line("0"), 1280, 720, Some((8, 16)), true).unwrap().shown);
+    }
+
+    #[test]
+    fn reads_parent_from_stat() {
+        assert_eq!(parent_of("8059 (tmux: client) S 8020 8059 8020 34817"), Some(8020));
+        // 名前に括弧が入っていても
+        assert_eq!(parent_of("42 (a) b (c)) R 7 42"), Some(7));
+        assert_eq!(parent_of("garbage"), None);
+    }
+
+    #[test]
+    fn console_is_a_vt_or_under_fbterm() {
+        assert!(on_console(u32::MAX, "/dev/tty1"));
+        assert!(!on_console(u32::MAX, "/dev/tty"));
+        assert!(!on_console(u32::MAX, "/dev/ttyS0"));
+        // このテスト自身は fbterm の子孫ではない (cargo test は tmux のペインや ssh から動かす)
+        assert!(!on_console(std::process::id(), "/dev/pts/4"));
     }
 
     #[test]

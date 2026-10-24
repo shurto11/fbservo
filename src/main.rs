@@ -14,7 +14,7 @@ mod smooth;
 mod term;
 mod tmux;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use engine::Engine;
 use fb::{Fb, Image, Rect};
 use hints::HintMode;
@@ -283,16 +283,24 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     // tmux の中なら自分のペインに描き、ペインが動いたり隠れたりしたら追いかける。
     // drmterm では画面全体に描くと端末が隠れたままになるので、--full でもペインを追う (fbrowse と同じ)
     let follow = (term.is_some() || !full) && tmux::inside();
-    let pane = if follow { tmux::pane(fb.width, fb.height, term.as_ref()) } else { None };
+    // /dev/fb0 は内蔵画面そのもの。内蔵画面に映っていない所 (別の tmux サーバや ssh のペイン、
+    // ほかのプログラムから起動されたとき) から描くと、内蔵画面に映っているものの上に絵を重ねて
+    // しまう。ペインを追うなら、内蔵画面に映っている間だけ描く (tmux::pane)。追わないなら、
+    // 起動した時点で内蔵画面に映っていなければ描かずに終わる
+    let console = fb.is_console();
+    if console && !follow && !on_console() {
+        bail!("内蔵画面 (fbterm かコンソール) に映っていないので /dev/fb0 には描きません (ファイルへ描くなら FBSERVO_FB)");
+    }
+    let pane = if follow { tmux::pane(fb.width, fb.height, term.as_ref(), console) } else { None };
     if follow && pane.is_none() {
         eprintln!("[pane] ペインの位置が分からないので画面全体に描きます");
     }
-    // 描く場所と、そこがいま画面に出ているか
+    // 描く場所と、そこがいま画面に出ているか (内蔵画面に描くのにペインの様子が分からなければ、分かるまで描かない)
     let mut area = pane.as_ref().map_or(fb.full(), |p| p.rect);
-    let mut shown = pane.as_ref().is_none_or(|p| p.shown);
+    let mut shown = pane.as_ref().map_or(!(follow && console), |p| p.shown);
     let panes = follow.then(|| {
         let w = waker.clone_box();
-        tmux::follow(fb.width, fb.height, term.clone(), move || w.wake())
+        tmux::follow(fb.width, fb.height, term.clone(), console, move || w.wake())
     });
     // 端末 (tmux の時計など) に上書きされた絵を描き直すか。drmterm の共有メモリは端末に上書きされない
     let repaint = term.is_none();
@@ -391,7 +399,10 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
                     Action::Redraw => redraw = true,
                     Action::Quit => {
                         fb.set_rect(None);
-                        fb.clear(area);
+                        // 隠れている間は、自分の絵はもう画面に無い (消すと映っている別のものを塗りつぶす)
+                        if shown && drawn {
+                            fb.clear(area);
+                        }
                         if follow && repaint {
                             tmux::refresh_clients();
                         }
@@ -546,6 +557,16 @@ fn read_kbd(ui: &mut Ui) {
             ui.smooth.release();
         }
     }
+}
+
+/// 起動した時点で、自分が内蔵画面に映っているか (tmux の中なら、自分のセッションを内蔵画面の
+/// クライアントが映しているか)
+fn on_console() -> bool {
+    if tmux::inside() {
+        return tmux::console_client().is_some_and(|c| tmux::shows_session(&c, &tmux::own_session_name()));
+    }
+    let tty = std::fs::read_link("/proc/self/fd/0").map(|p| p.display().to_string()).unwrap_or_default();
+    tmux::on_console(std::process::id(), &tty)
 }
 
 fn drain(fd: RawFd) {
