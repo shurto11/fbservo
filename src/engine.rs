@@ -233,11 +233,6 @@ impl Engine {
         self.delegate.frame_ready.set(true);
     }
 
-    /// 変化が無くても次のループで描き直させる。
-    pub fn request_frame(&self) {
-        self.delegate.frame_ready.set(true);
-    }
-
     /// 新しいフレームが届いていれば true を返し、フラグを下ろす。
     pub fn take_frame(&self) -> bool {
         self.delegate.frame_ready.replace(false)

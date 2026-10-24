@@ -41,7 +41,7 @@ drmterm の中では、drmterm の画面のペインに描く (--full でもペ�
                 開いたページの入力欄にフォーカスがあれば、選ばなくても入力
   d             直前の入力を削除
   b / r         戻る / 再読込         Enter/Space  そのままページへ送る (矢印も)
-  s             描き直し              + - 0        ズームイン / アウト / リセット
+  + - 0         ズームイン / アウト / リセット
   t             新しいタブ            ] / [        次 / 前のタブ
   x             タブを閉じる          y            URL を tmux バッファへコピー
   ?             このヘルプ            Q            終了 (Ctrl-C はどのモードでも)
@@ -621,7 +621,6 @@ enum Cmd {
     Back,
     Forward,
     Reload,
-    Redraw,
     DeleteTyped,
     NewTab,
     EditUrl,
@@ -671,7 +670,6 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
         Key::Char('b') => Cmd::Back,
         Key::Char('L') => Cmd::Forward,
         Key::Char('r') => Cmd::Reload,
-        Key::Char('s') => Cmd::Redraw,
         Key::Char('d') => Cmd::DeleteTyped,
         Key::Char('t') => Cmd::NewTab,
         Key::Char('O') => Cmd::EditUrl,
@@ -689,6 +687,7 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
         Key::Char('o') => Cmd::NotYet("お気に入りに追加", "2-4"),
         Key::Char('p') => Cmd::NotYet("クリップボード表示", "2-6"),
         Key::Char('T') => Cmd::NotYet("タブを別ペインへ移す", "3-2"),
+        Key::Char('s') => Cmd::NotNeeded("撮り直し (絵は自分で描き直す。崩れたら r で読み直す)"),
         Key::Char('c' | 'C') => Cmd::NotNeeded("動画モード (fbservo は常に動く絵を描いている)"),
         Key::Char('M' | 'P') => Cmd::NotNeeded("mpv で再生 (動画は見ない)"),
         Key::Char('i') => Cmd::NotNeeded("入力モード (f で入力欄を選ぶと入る)"),
@@ -865,7 +864,6 @@ fn run_cmd(eng: &mut Engine, ui: &mut Ui, cmd: Cmd) -> Action {
         Cmd::Back => eng.back(),
         Cmd::Forward => eng.forward(),
         Cmd::Reload => eng.reload(),
-        Cmd::Redraw => eng.request_frame(),
         Cmd::DeleteTyped => {
             say(&format!("入力削除 ({} 文字)", ui.typed));
             for _ in 0..std::mem::take(&mut ui.typed) {
