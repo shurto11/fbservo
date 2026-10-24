@@ -1,2 +1,5 @@
 /target
 design.md
+/bench/bin
+/bench/out
+__pycache__/
