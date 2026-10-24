@@ -1,8 +1,10 @@
-//! fbservo: Servo (Rust 製ブラウザエンジン) でページを描き、/dev/fb0 へ直接書く試作。
+//! fbservo: Servo (Rust 製ブラウザエンジン) でページを描き、/dev/fb0 (drmterm の中なら
+//! その共有メモリ) へ直接書く試作。
 //!
 //! 動作中は端末に何も出さない (出すとページの絵を上書きする)。ログは
 //! $XDG_RUNTIME_DIR/fbservo.log に書き、終了時にフレーム時間とメモリの集計を表示する。
 
+mod drmterm;
 mod engine;
 mod fb;
 mod hints;
@@ -30,6 +32,7 @@ const USAGE: &str = "\
 
 tmux の中では自分のペインに描き、ペインの移動・大きさの変化・ウィンドウの切り替えに
 ついていく (fbrowse の --auto と同じ)。--full を付けると画面全体に描く。
+drmterm の中では、drmterm の画面のペインに描く (--full でもペインを追う)。
 
 キー (fbrowse と同じ配置):
   hjkl          スクロール            gg / G       先頭 / 末尾
@@ -259,11 +262,28 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     let first = target.and_then(resolve);
     let mode = if first.is_some() { Mode::Normal } else { Mode::Prompt(Open::Here, String::new()) };
     let mut ui = Ui { mode, pending_g: false, typed: 0, smooth: Smooth::default(), kbd: Kbd::open() };
+    if let Some(s) = fb.drmterm_keys() {
+        ui.kbd.add_drmterm(s);
+    }
     let url = first.unwrap_or_else(|| Url::parse("about:blank").unwrap());
 
-    // tmux の中なら自分のペインに描き、ペインが動いたり隠れたりしたら追いかける
-    let follow = !full && tmux::inside();
-    let pane = if follow { tmux::pane(fb.width, fb.height) } else { None };
+    // drmterm の中なら、ペインの位置は drmterm が教える升目の大きさと、drmterm 上の tmux クライアントから求める
+    let term = fb.drmterm().map(|i| tmux::Term { cell: (i.cell_w, i.cell_h), client: i.tty.clone() });
+    if let Some(i) = fb.drmterm() {
+        eprintln!(
+            "[drmterm] {} へ描く ({}x{}、升目 {}x{}、tty {})",
+            i.path,
+            i.width,
+            i.height,
+            i.cell_w,
+            i.cell_h,
+            i.tty.as_deref().unwrap_or("不明")
+        );
+    }
+    // tmux の中なら自分のペインに描き、ペインが動いたり隠れたりしたら追いかける。
+    // drmterm では画面全体に描くと端末が隠れたままになるので、--full でもペインを追う (fbrowse と同じ)
+    let follow = (term.is_some() || !full) && tmux::inside();
+    let pane = if follow { tmux::pane(fb.width, fb.height, term.as_ref()) } else { None };
     if follow && pane.is_none() {
         eprintln!("[pane] ペインの位置が分からないので画面全体に描きます");
     }
@@ -272,8 +292,14 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
     let mut shown = pane.as_ref().is_none_or(|p| p.shown);
     let panes = follow.then(|| {
         let w = waker.clone_box();
-        tmux::follow(fb.width, fb.height, move || w.wake())
+        tmux::follow(fb.width, fb.height, term.clone(), move || w.wake())
     });
+    // 端末 (tmux の時計など) に上書きされた絵を描き直すか。drmterm の共有メモリは端末に上書きされない
+    let repaint = term.is_none();
+    // 入力欄を出している間に drmterm で空けておく、端末の最下行の高さ
+    let cell_h = term.as_ref().map_or(0, |t| t.cell.1);
+    // 一度でも描いたか (それまでは drmterm の共有メモリに前のクライアントの絵が残っている)
+    let mut drawn = false;
     eprintln!("[start] {url} ({}x{} at {},{}, scale {scale})", area.w, area.h, area.x, area.y);
 
     let _raw = RawMode::enter();
@@ -333,7 +359,7 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
                 eng.resize(area.w, area.h);
                 // 前の大きさの絵はもう描かない
                 last = None;
-                if !inside(old, area) {
+                if !inside(old, area) && repaint {
                     // 縮んだり動いたりした跡は隣のペインのものになった。気づくまでの間に
                     // 上書きしてしまった分を、tmux に端末の文字で描き直してもらう
                     tmux::refresh_clients();
@@ -364,8 +390,9 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
                     Action::None => {}
                     Action::Redraw => redraw = true,
                     Action::Quit => {
+                        fb.set_rect(None);
                         fb.clear(area);
-                        if follow {
+                        if follow && repaint {
                             tmux::refresh_clients();
                         }
                         return Ok(());
@@ -387,6 +414,7 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
         if eng.take_input_focused() && matches!(ui.mode, Mode::Normal) {
             enter_insert(&mut ui);
         }
+        fb.set_rect(drm_rect(&ui.mode, area, shown, drawn, cell_h));
         // 隠れている間は描かない。届いたフレームは表示に戻ったときに描く
         if ui.mode.uses_terminal() || !shown {
             continue;
@@ -425,13 +453,14 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
                 if let Some(at) = fb.write_at(&img, area, target) {
                     wait_spinning(&mut eng, wake_fd, at, &mut ready_at);
                 }
-                let drawn = fb.present(&img, area, target);
+                let out = fb.present(&img, area, target);
+                drawn = true;
                 // 間に合わず、決めた間隔より遅れて出た分 (ログ用)
-                let late = target.map_or(Duration::ZERO, |v| drawn.vblank.saturating_duration_since(v));
-                let t3 = drawn.start;
+                let late = target.map_or(Duration::ZERO, |v| out.vblank.saturating_duration_since(v));
+                let t3 = out.start;
                 last_blit = Instant::now();
-                blit_took = drawn.took;
-                presented = (shown_step.is_some() && ui.smooth.active()).then_some(drawn.vblank);
+                blit_took = out.took;
+                presented = (shown_step.is_some() && ui.smooth.active()).then_some(out.vblank);
                 if let Some(old) = last.replace(img) {
                     spare = old.data;
                 }
@@ -453,14 +482,29 @@ fn run(fb: &mut Fb, target: Option<&str>, scale: f32, full: bool, stats: &mut St
                     if late > fb.period() / 2 { format!(" late +{:.0}ms", late.as_secs_f64() * 1000.0) } else { String::new() }
                 );
             }
-        } else if redraw || last_blit.elapsed() >= Duration::from_secs(1) {
+        } else if redraw || (repaint && last_blit.elapsed() >= Duration::from_secs(1)) {
             if let Some(img) = &last {
                 fb.draw(img, area);
             }
             last_blit = Instant::now();
         }
+        // 初めて描いたら、drmterm に重ねてもらう
+        fb.set_rect(drm_rect(&ui.mode, area, shown, drawn, cell_h));
     }
     Ok(())
+}
+
+/// drmterm に申告する、絵を重ねてほしい矩形 (fb0 では使わない)。端末に文字を出している間は
+/// そこを空け (入力欄は最下行、キー一覧は全体)、ペインが隠れている間と、まだ何も描いていない間
+/// (共有メモリに前のクライアントの絵が残っている) は取り下げる。ペインの大きさが変わった直後は、
+/// 次のコマが届くまで前の絵 (ずれている) を重ねたままにする (取り下げると端末の文字がちらつく)。
+fn drm_rect(mode: &Mode, area: Rect, shown: bool, drawn: bool, cell_h: u32) -> Option<Rect> {
+    match mode {
+        _ if !shown || !drawn => None,
+        Mode::Help => None,
+        Mode::Prompt(..) => Some(Rect { h: area.h.saturating_sub(cell_h), ..area }),
+        _ => Some(area),
+    }
 }
 
 /// スクロールキーを押してからこれだけ経ってもフレームが来なければ、画面が変わらない

@@ -9,6 +9,9 @@
 //! まだ押されているか」を答える。ほかのペインで打ったキーではスクロールしない。
 //! 読めないとき (input グループに入っていない、ssh 越しなど) は、端末の文字だけで動かす。
 //!
+//! drmterm の中では、drmterm がキーボードを握る (EVIOCGRAB) ので、キーボードからは何も
+//! 届かない。代わりに drmterm がソケットで送ってくるキー操作 (KEY 行、src/drmterm.rs) を読む。
+//!
 //! 文字とキーの対応は US / JIS 配列の位置 (KEY_H/J/K/L) で決め打ちする。
 //! 覚えるのはこの 4 つのキーの状態だけで、ほかのキーのイベントは読み捨てる。
 //! 起動したあとに挿したキーボードは読まない。
@@ -17,6 +20,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -54,6 +58,8 @@ struct KeyState {
 #[derive(Default)]
 pub struct Kbd {
     files: Vec<File>,
+    /// drmterm からキー操作を受け取る接続と、まだ改行の来ていない分
+    drmterm: Option<(UnixStream, Vec<u8>)>,
     keys: [KeyState; 4],
 }
 
@@ -78,11 +84,17 @@ impl Kbd {
         if files.is_empty() {
             eprintln!("[kbd] キーボードを読めないので、端末のキーリピートで長押しを判断します");
         }
-        Kbd { files, keys: Default::default() }
+        Kbd { files, drmterm: None, keys: Default::default() }
+    }
+
+    /// drmterm から届くキー操作も読む
+    pub fn add_drmterm(&mut self, s: UnixStream) {
+        eprintln!("[kbd] drmterm からキー操作を受け取る");
+        self.drmterm = Some((s, Vec::new()));
     }
 
     pub fn fds(&self) -> Vec<RawFd> {
-        self.files.iter().map(|f| f.as_raw_fd()).collect()
+        self.files.iter().map(|f| f.as_raw_fd()).chain(self.drmterm.as_ref().map(|(s, _)| s.as_raw_fd())).collect()
     }
 
     /// 届いているイベントを全部読む。読めなくなったデバイス (抜いたキーボード) は閉じる。
@@ -111,6 +123,36 @@ impl Kbd {
             } else {
                 i += 1;
             }
+        }
+        self.read_drmterm(now);
+    }
+
+    /// drmterm から届いた KEY 行を読む。描くためのソケットと同じものなので、待たずに読む
+    fn read_drmterm(&mut self, now: Instant) {
+        let Some((s, pending)) = &mut self.drmterm else {
+            return;
+        };
+        let mut buf = [0u8; 1024];
+        let gone = loop {
+            let n = unsafe { libc::recv(s.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+            if n <= 0 {
+                break n == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN);
+            }
+            pending.extend_from_slice(&buf[..n as usize]);
+        };
+        let mut events = Vec::new();
+        while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            if let Some(ev) = parse_key(&String::from_utf8_lossy(&line)) {
+                events.push(ev);
+            }
+        }
+        if gone {
+            eprintln!("[kbd] drmterm との接続が切れた");
+            self.drmterm = None;
+        }
+        for (code, value) in events {
+            self.event(code, value, now);
         }
     }
 
@@ -158,6 +200,14 @@ impl Kbd {
     }
 }
 
+/// drmterm の `KEY <コード> <値>` 行
+fn parse_key(line: &str) -> Option<(u16, i32)> {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        ["KEY", code, value] => Some((code.parse().ok()?, value.parse().ok()?)),
+        _ => None,
+    }
+}
+
 /// /dev/input/event*
 fn event_devices() -> Vec<PathBuf> {
     let Ok(dir) = std::fs::read_dir("/dev/input") else {
@@ -184,6 +234,7 @@ fn has_hjkl(fd: RawFd) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     const J: u16 = 36;
 
@@ -212,6 +263,26 @@ mod tests {
         k.event(J, 1, ms(2080));
         assert_eq!(k.press('j', ms(2085)), Press::Tap);
         assert_eq!(k.press('j', ms(2086)), Press::Held);
+    }
+
+    #[test]
+    fn reads_keys_from_drmterm() {
+        let t = Instant::now();
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        let mut k = Kbd::default();
+        k.add_drmterm(rx);
+        // 行の途中で切れて届いても、改行が来てから読む。関係ない行は読み捨てる
+        tx.write_all(b"KEY 36 1\nFB x\nKEY 3").unwrap();
+        k.read(t);
+        assert!(k.is_down('j'));
+        assert_eq!(k.press('j', t), Press::Held);
+        tx.write_all(b"6 0\n").unwrap();
+        k.read(t);
+        assert!(!k.is_down('j'));
+        // drmterm が終わったら閉じる (そのあとは端末の文字だけで動く)
+        drop(tx);
+        k.read(t);
+        assert!(k.drmterm.is_none());
     }
 
     #[test]

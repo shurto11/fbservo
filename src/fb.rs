@@ -1,10 +1,15 @@
-//! フレームバッファ (/dev/fb0) への書き込み。
+//! フレームバッファ (/dev/fb0、または drmterm の共有メモリ) への書き込み。
 //!
 //! fb0 を mmap し、Servo から読み出した絵を行ごとにコピーする。fb0 は XRGB8888
 //! (メモリ上は B,G,R,X) なので、GL から BGRA で読んだ絵なら並べ替えずにそのまま書ける。
 //! サイズと行幅は sysfs から読む。描く場所は画面全体か、tmux ペインの矩形 (`Rect`)。
 //! 書く時刻は、画面の走査と重ならないように選ぶ (`present`、src/scan.rs)。
+//!
+//! drmterm (外部モニターの端末) の中で起動したら、fb0 の代わりに drmterm の共有メモリへ
+//! 同じ並びで書き、書くたびに描き直してもらう (src/drmterm.rs)。drmterm は次の垂直帰線を
+//! 待ってから画面へ写すので、外部モニターの帰線と帰線の真ん中で書く。
 
+use crate::drmterm::{self, Overlay};
 use crate::scan::{decide, line_at, refresh_after, time_at, vblank_of, Clock, Decision, Span, Timing, FBIO_WAITFORVSYNC};
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
@@ -53,15 +58,20 @@ pub struct Fb {
     scan: Option<(Timing, Clock)>,
     /// 垂直帰線の間隔
     period: Duration,
+    /// drmterm へ書くとき、drmterm が画面を出している CRTC の垂直帰線 (取れなければ None)
+    crtc: Option<drmterm::Vblank>,
     /// (書いた幅, 1 行書くのにかかった最短の時間, 書いた回数)。書いている間に走査がどれだけ
     /// 進むかの見積もりに使う。速く書けると見込むほど早く書き始めるので、最初の何回か
     /// (mmap した所へ初めて書くときなどは遅い) は使わない
     row_time: Option<(usize, Duration, u32)>,
+    /// drmterm へ書いているときの接続
+    drm: Option<Overlay>,
 }
 
 /// `present` で絵を出した記録。
 pub struct Shown {
-    /// この絵が出る走査の前の垂直帰線の時刻 (走査の位置が分からなければ、書き始めた時刻)
+    /// この絵が出る走査の前の垂直帰線の時刻 (drmterm へ書くときは、drmterm が画面へ写す帰線。
+    /// どちらも分からなければ、書き始めた時刻)
     pub vblank: Instant,
     /// 書き始めた時刻
     pub start: Instant,
@@ -74,9 +84,21 @@ fn read_sysfs(name: &str) -> Result<String> {
     Ok(std::fs::read_to_string(&p).with_context(|| format!("{p} を読めません"))?.trim().to_string())
 }
 
+fn mmap(file: &File, len: usize, path: &str) -> Result<*mut u8> {
+    let map = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+    if map == libc::MAP_FAILED {
+        bail!("{path} を mmap できません: {}", std::io::Error::last_os_error());
+    }
+    Ok(map.cast())
+}
+
 impl Fb {
-    /// FBSERVO_FB で書き込み先を差し替えられる (動作確認用。サイズは fb0 と同じ前提)。
+    /// drmterm の中なら、その共有メモリへ書く。そうでなければ /dev/fb0 へ。
+    /// FBSERVO_FB で fb0 の代わりの書き込み先を差し替えられる (動作確認用。サイズは fb0 と同じ前提)。
     pub fn open() -> Result<Fb> {
+        if let Some(ov) = drmterm::connect() {
+            return Fb::open_drmterm(ov);
+        }
         let bpp: u32 = read_sysfs("bits_per_pixel")?.parse()?;
         if bpp != 32 {
             bail!("32bpp 以外のフレームバッファには対応していません ({bpp}bpp)");
@@ -92,16 +114,11 @@ impl Fb {
             .open(&path)
             .with_context(|| format!("{path} を開けません (video グループに入っていますか)"))?;
         let len = stride * height as usize;
-        let map = unsafe {
-            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0)
-        };
-        if map == libc::MAP_FAILED {
-            bail!("{path} を mmap できません: {}", std::io::Error::last_os_error());
-        }
+        let map = mmap(&file, len, &path)?;
         let vsync = std::env::var("FBSERVO_VSYNC").map_or(true, |v| v != "0");
         let timing = if vsync { Timing::from_edid(width, height) } else { None };
         let scan = timing.and_then(|t| Some((t, Clock::start(file.try_clone().ok()?, t.period))));
-        let mut fb = Fb { file, map: map.cast(), len, width, height, stride, vsync, scan, period: Duration::ZERO, row_time: None };
+        let mut fb = Fb { file, map, len, width, height, stride, vsync, scan, period: Duration::ZERO, crtc: None, row_time: None, drm: None };
         fb.period = match timing {
             Some(t) => t.period,
             None => fb.measure_period(),
@@ -109,8 +126,69 @@ impl Fb {
         Ok(fb)
     }
 
+    fn open_drmterm(ov: Overlay) -> Result<Fb> {
+        let info = &ov.info;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&info.path)
+            .with_context(|| format!("drmterm の共有メモリ {} を開けません", info.path))?;
+        let stride = info.stride as usize * 4;
+        let len = stride * info.height as usize;
+        let map = mmap(&file, len, &info.path)?;
+        let crtc = drmterm::Vblank::open(info).and_then(|c| Some((c.period()?, c)));
+        Ok(Fb {
+            file,
+            map,
+            len,
+            width: info.width,
+            height: info.height,
+            stride,
+            vsync: false,
+            scan: None,
+            // 帰線の時刻を取れなければ (VNC の drmterm など)、スクロールのコマの間隔は 60Hz とみなす
+            period: crtc.as_ref().map_or(Duration::from_micros(16_667), |(p, _)| *p),
+            crtc: crtc.map(|(_, c)| c),
+            row_time: None,
+            drm: Some(ov),
+        })
+    }
+
+    /// drmterm へ書いているなら、その情報
+    pub fn drmterm(&self) -> Option<&drmterm::Info> {
+        self.drm.as_ref().map(|ov| &ov.info)
+    }
+
+    /// drmterm へ書いているなら、キー操作 (KEY 行) を読むための接続
+    pub fn drmterm_keys(&self) -> Option<std::os::unix::net::UnixStream> {
+        self.drm.as_ref()?.key_stream()
+    }
+
+    /// drmterm に、絵を重ねてほしい矩形を申告する (None で取り下げ。fb0 なら何もしない)。
+    pub fn set_rect(&mut self, r: Option<Rect>) {
+        if let Some(ov) = &mut self.drm {
+            ov.set_rect(r);
+        }
+    }
+
+    /// 書いたので、drmterm に描き直してもらう (fb0 なら書いた時点で画面に出る)
+    fn written(&mut self) {
+        if let Some(ov) = &mut self.drm {
+            ov.frame();
+        }
+    }
+
     /// 書く時刻の決め方 (ログ用)
     pub fn describe(&self) -> String {
+        if self.drm.is_some() {
+            return match self.crtc {
+                Some(_) => format!(
+                    "drmterm の共有メモリへ、外部モニターの帰線 ({:.3}ms ごと) と帰線の真ん中で書く",
+                    self.period.as_secs_f64() * 1000.0
+                ),
+                None => "drmterm の共有メモリへ書く (帰線の時刻を取れないので、画面へ出す時刻は drmterm 任せ)".to_string(),
+            };
+        }
         match &self.scan {
             Some((t, clock)) => format!(
                 "走査 {} 行 (表示 {} 行)、{:.3}ms (EDID)。{}",
@@ -215,6 +293,25 @@ impl Fb {
         Some((*t, anchor, Span { y0: area.y as f64, y1: (area.y as usize + ch) as f64, speed }))
     }
 
+    /// drmterm へ書くとき、target の時刻の帰線で出すにはいつ書けばよいか。drmterm は FRAME を
+    /// 受けるとすぐ組み、次の帰線を待ってから画面へ写す。帰線のまぎわに書くと、わずかな揺れで
+    /// 前後どちらの帰線にも転ぶ (1 コマ止まったり、2 コマ同時に出て飛んだりする) ので、
+    /// target にいちばん近い帰線の半コマ前 (帰線と帰線の真ん中) に書く。
+    fn crtc_write_at(&self, target: Instant) -> Option<Instant> {
+        let last = self.crtc.as_ref()?.last()?;
+        let k = (target.saturating_duration_since(last).as_secs_f64() / self.period.as_secs_f64()).round();
+        (last + self.period.mul_f64(k)).checked_sub(self.period / 2)
+    }
+
+    /// drmterm へ書き終えた (FRAME を送った) 絵が出る帰線の時刻。drmterm が組み終える前に
+    /// 帰線が来そうなら、その次
+    fn crtc_shown_at(&self, sent: Instant) -> Option<Instant> {
+        // drmterm が FRAME を受けてから組み終えるまで (測ると 1ms ほど)
+        const COMPOSE: Duration = Duration::from_millis(2);
+        let next = self.crtc.as_ref()?.last()? + self.period;
+        Some(if next < sent + COMPOSE { next + self.period } else { next })
+    }
+
     /// `present` が書き始める予定の時刻 (待たずに書けるなら None)。それまでに別のことをして
     /// おきたいときに使う (main.rs は Servo のイベントループを回して、次のコマができた時刻を測る)。
     pub fn write_at(&self, img: &Image, area: Rect, target: Option<Instant>) -> Option<Instant> {
@@ -227,6 +324,8 @@ impl Fb {
                     Decision::Write(_) => None,
                 }
             }
+            // 帰線の時刻を取れなければ (モニターが消えているなど)、target まで
+            None if self.crtc.is_some() => target.map(|v| self.crtc_write_at(v).unwrap_or(v)),
             // 割り込みを待つときは、target の半コマ前を過ぎてから最後の 1 回を待つ (wait_vsync_until)。
             // 待てない書き込み先なら target まで
             None if self.vsync => target.and_then(|v| v.checked_sub(self.period / 2)),
@@ -251,6 +350,12 @@ impl Fb {
                 };
                 Some(vblank_of(t, anchor, refresh))
             }
+            None if self.crtc.is_some() => {
+                if let Some(at) = target.map(|v| self.crtc_write_at(v).unwrap_or(v)) {
+                    std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                }
+                None
+            }
             None => {
                 match target {
                     Some(v) => self.wait_vsync_until(v, self.period),
@@ -262,6 +367,7 @@ impl Fb {
         let start = Instant::now();
         self.draw(img, area);
         let took = start.elapsed();
+        let vblank = vblank.or_else(|| self.crtc_shown_at(start + took));
         if let Some((cw, ch)) = self.fit(img.w, img.h, area).filter(|&(_, ch)| ch > 0) {
             let per_row = took / ch as u32;
             self.row_time = match self.row_time {
@@ -295,6 +401,7 @@ impl Fb {
                 }
             }
         }
+        self.written();
     }
 
     /// 矩形を黒で塗る。
@@ -308,6 +415,7 @@ impl Fb {
         for r in 0..ch {
             mem[base + r * stride..][..cw * 4].fill(0);
         }
+        self.written();
     }
 }
 
@@ -337,7 +445,9 @@ mod tests {
             vsync: false,
             scan: None,
             period: Duration::ZERO,
+            crtc: None,
             row_time: None,
+            drm: None,
         }
     }
 
