@@ -1,4 +1,4 @@
-//! j/k/h/l のスクロールを一定の速さで流す。
+//! j/k/h/l のスクロールを一定の速さで流す (Ctrl-d / Ctrl-u の 1 画面も)。
 //!
 //! 速さは Vimium で長押ししたときと同じくらい (毎秒 1000px) にし、動き出しも止まる前も
 //! 変えない。1 コマで「速さ × そのコマを出すまでの間隔」だけ送る。重いページで 30 コマ/秒に
@@ -9,12 +9,16 @@
 //! 離上が分からないときは、端末から文字が届くたびに 1 回分ずつ足す。キーリピートは毎秒 30 回
 //! (1800px/秒) 届いて速さを上回るので、溜めるのは 2 回分までにし、離したあとに流れ続けるのを
 //! 0.1 秒ほどに抑える。
+//!
+//! Ctrl-d / Ctrl-u の 1 画面は、毎秒 1000px では遅いので、長さによらず `PAGE_TIME` で流す。
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// 流す速さ (px/秒)
 const SPEED: f32 = 1000.0;
+/// 1 画面 (Ctrl-d / Ctrl-u) を流し終えるまでの時間
+const PAGE_TIME: Duration = Duration::from_millis(150);
 /// 送った分がこれだけ経っても描かれなければ、ページの端に着いて動けなかったとみなす
 const STUCK: Duration = Duration::from_millis(150);
 /// 描かれるのを待っている間に、端に着いていないか確かめに来る間隔 (ms)
@@ -34,12 +38,15 @@ pub struct Smooth {
     carry: [f32; 2],
     /// 送った分がまだ描かれていなければ、(送った時刻, そのコマを出すまでの間隔)
     in_flight: Option<(Instant, Duration)>,
+    /// 流す速さ (px/秒)。hjkl は SPEED、1 画面は PAGE_TIME で流し終える速さ
+    speed: f32,
 }
 
 impl Smooth {
     /// キー key を押したまま流し始める。(dx, dy) は 1 回分。
     pub fn hold(&mut self, key: char, dx: f32, dy: f32) {
         self.turn([dx, dy]);
+        self.speed = SPEED;
         self.held = Some(key);
         self.moved = 0.0;
         self.left = [0.0; 2];
@@ -48,10 +55,17 @@ impl Smooth {
     /// 1 回分 (dx, dy) 進める。同じ向きなら足すが、溜めるのは 2 回分まで。
     pub fn add(&mut self, dx: f32, dy: f32) {
         self.turn([dx, dy]);
+        self.speed = SPEED;
         self.held = None;
         for (l, d) in self.left.iter_mut().zip([dx, dy]) {
             *l = (*l + d).clamp(-2.0 * d.abs(), 2.0 * d.abs());
         }
+    }
+
+    /// 1 画面 (dx, dy) を PAGE_TIME で進める。続けて押したら 2 画面分まで溜める。
+    pub fn page(&mut self, dx: f32, dy: f32) {
+        self.add(dx, dy);
+        self.speed = hypot([dx, dy]) / PAGE_TIME.as_secs_f32();
     }
 
     /// 違うキーを押したら、前のキーの残りは捨てる (j のあとすぐ k を押したら、すぐ上へ向かう)。
@@ -115,7 +129,7 @@ impl Smooth {
             }
             return None;
         }
-        let budget = SPEED * interval.as_secs_f32();
+        let budget = self.speed * interval.as_secs_f32();
         let mut out = [0.0; 2];
         if self.held.is_some() {
             let len = hypot(self.step);
@@ -278,6 +292,19 @@ mod tests {
         s.add(0.0, 60.0);
         s.add(0.0, -60.0);
         assert_eq!(run(&mut s, 30, F60).iter().sum::<f32>(), -60.0);
+    }
+
+    #[test]
+    fn page_moves_one_screen_quickly() {
+        let mut s = Smooth::default();
+        s.page(0.0, 720.0);
+        let steps = run(&mut s, 30, F60);
+        // 0.15 秒 = 60 コマ/秒で 9 コマ
+        assert_eq!(steps.iter().sum::<f32>(), 720.0);
+        assert_eq!(steps.len(), 9);
+        // そのあと j を押したら、ふつうの速さに戻る
+        s.add(0.0, 60.0);
+        assert_eq!(run(&mut s, 20, F60).len(), 4);
     }
 
     #[test]

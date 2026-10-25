@@ -38,7 +38,8 @@ drmterm の中では、drmterm の画面のペインに描く (--full でもペ�
   hjkl          スクロール            gg / G       先頭 / 末尾
   f             リンクヒント (ラベルの 2 文字でクリック。f / Esc で取消)
                 入力欄を選ぶとそのまま入力 (Enter で確定、Esc で戻る)
-  b / r         戻る / 再読込         Enter/Space  そのままページへ送る (矢印も)
+  Ctrl-d/Ctrl-u 1 画面 下 / 上        Space        そのままページへ送る (矢印も)
+  b / r         戻る / 再読込
   + - 0         ズームイン / アウト / リセット
   t             新しいタブ            ] / [        次 / 前のタブ
   x             タブを閉じる          y            URL を tmux バッファへコピー
@@ -508,6 +509,7 @@ fn is_scroll_key(k: &Key) -> bool {
     matches!(
         k,
         Key::Char('j' | 'k' | 'h' | 'l' | ' ')
+            | Key::Ctrl('d' | 'u')
             | Key::Up
             | Key::Down
             | Key::Left
@@ -543,7 +545,9 @@ enum Cmd {
     Hints,
     Top,
     Bottom,
-    /// Enter・Space・矢印などをそのままページへ送る
+    /// 1 画面 下 (1) / 上 (-1) へ流す
+    Screen(f32),
+    /// Space・矢印などをそのままページへ送る
     Page(Key),
     Back,
     Forward,
@@ -583,8 +587,11 @@ fn normal_cmd(k: &Key, pending_g: &mut bool) -> Cmd {
             Cmd::None
         }
         Key::Char('G') => Cmd::Bottom,
-        Key::Enter
-        | Key::Char(' ')
+        Key::Ctrl('d') => Cmd::Screen(1.0),
+        Key::Ctrl('u') => Cmd::Screen(-1.0),
+        // 入力欄の外では使い道が無い (入力欄のフォーカスはヒントで選んだときにしか無い)
+        Key::Enter => Cmd::NotNeeded("Enter (スクロールは Ctrl-d / Ctrl-u)"),
+        Key::Char(' ')
         | Key::Up
         | Key::Down
         | Key::Left
@@ -764,8 +771,8 @@ fn enter_insert(ui: &mut Ui) {
 }
 
 fn run_cmd(eng: &mut Engine, ui: &mut Ui, cmd: Cmd) -> Action {
-    // hjkl 以外の操作をしたら、まだ送っていないスクロールは捨てる (gg のあとに流れ続けないように)
-    if !matches!(cmd, Cmd::Scroll(..) | Cmd::None) {
+    // hjkl・Ctrl-d・Ctrl-u 以外の操作をしたら、まだ送っていないスクロールは捨てる (gg のあとに流れ続けないように)
+    if !matches!(cmd, Cmd::Scroll(..) | Cmd::Screen(_) | Cmd::None) {
         ui.smooth.stop();
     }
     match cmd {
@@ -776,6 +783,7 @@ fn run_cmd(eng: &mut Engine, ui: &mut Ui, cmd: Cmd) -> Action {
             Press::Tap | Press::Unknown => ui.smooth.add(dx, dy),
             Press::Repeat => {}
         },
+        Cmd::Screen(dir) => ui.smooth.page(0.0, dir * eng.height as f32),
         Cmd::Hints => {
             let (h, slot) = HintMode::new();
             eng.show_hints(slot);
@@ -850,7 +858,10 @@ mod tests {
         assert_eq!(cmd('j'), Cmd::Scroll('j', 0.0, LINE));
         assert_eq!(cmd('g'), Cmd::None);
         assert_eq!(cmd('G'), Cmd::Bottom);
-        assert_eq!(normal_cmd(&Key::Enter, &mut g), Cmd::Page(Key::Enter));
+        assert_eq!(normal_cmd(&Key::Ctrl('d'), &mut g), Cmd::Screen(1.0));
+        assert_eq!(normal_cmd(&Key::Ctrl('u'), &mut g), Cmd::Screen(-1.0));
+        assert!(matches!(normal_cmd(&Key::Enter, &mut g), Cmd::NotNeeded(_)));
+        assert_eq!(normal_cmd(&Key::Char(' '), &mut g), Cmd::Page(Key::Char(' ')));
     }
 
     #[test]
