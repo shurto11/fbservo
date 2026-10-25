@@ -38,7 +38,6 @@ drmterm の中では、drmterm の画面のペインに描く (--full でもペ�
   hjkl          スクロール            gg / G       先頭 / 末尾
   f             リンクヒント (ラベルの 2 文字でクリック。f / Esc で取消)
                 入力欄を選ぶとそのまま入力 (Enter で確定、Esc で戻る)
-                開いたページの入力欄にフォーカスがあれば、選ばなくても入力
   b / r         戻る / 再読込         Enter/Space  そのままページへ送る (矢印も)
   + - 0         ズームイン / アウト / リセット
   t             新しいタブ            ] / [        次 / 前のタブ
@@ -102,8 +101,7 @@ fn log_path() -> PathBuf {
 
 enum Mode {
     Normal,
-    /// キーをそのままページへ送る (リンクヒントで入力欄を選ぶか、開いたページの入力欄に
-    /// フォーカスが当たっていると入る)
+    /// キーをそのままページへ送る (リンクヒントで入力欄を選ぶと入る)
     Insert,
     /// 端末の最下行で URL を入力中 (その間は fb0 へ描かない)
     Prompt(Open, String),
@@ -354,9 +352,10 @@ fn run(fb: &mut Fb, target: Option<&str>, full: bool) -> Result<()> {
         eng.spin();
         // ヒントの JS の結果は spin の中で届く。先に打ったラベルがあればここでクリックする
         finish_hint(&eng, &mut ui);
-        // 開いたページが最初から入力欄にフォーカスを当てていたら (検索欄など)、そのまま打てるようにする
-        if eng.take_input_focused() && matches!(ui.mode, Mode::Normal) {
-            enter_insert(&mut ui);
+        // 開いたページが入力欄にフォーカスを当てていたら (検索欄など)、外す。入力モードには
+        // リンクヒントで入力欄を選んだときだけ入る (読み込みを終える前に選んで打っていたら外さない)
+        if eng.take_loaded() && !matches!(ui.mode, Mode::Insert) {
+            eng.run_js(hints::BLUR_JS);
         }
         fb.set_rect(drm_rect(&ui.mode, area, shown, drawn, cell_h));
         // 隠れている間は描かない。届いたフレームは表示に戻ったときに描く
@@ -636,6 +635,7 @@ fn handle_key(eng: &mut Engine, ui: &mut Ui, k: Key) -> Action {
         Mode::Insert => {
             match k {
                 Key::Esc => {
+                    eng.run_js(hints::BLUR_JS);
                     ui.mode = Mode::Normal;
                     say("入力モード終了");
                     return Action::None;
@@ -757,8 +757,7 @@ fn finish_hint(eng: &Engine, ui: &mut Ui) {
     }
 }
 
-/// 入力モードへ入る。ヒントで入力欄を選んだときと、開いたページが入力欄にフォーカスを
-/// 当てていたとき。
+/// 入力モードへ入る (ヒントで入力欄を選んだとき)。
 fn enter_insert(ui: &mut Ui) {
     ui.mode = Mode::Insert;
     say("入力モード (Enter で確定、Esc で戻る)");

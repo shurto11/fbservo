@@ -12,7 +12,7 @@ use dpi::PhysicalSize;
 use euclid::Point2D;
 use servo::{
     Code, ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, DeviceVector2D,
-    EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
+    EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, RenderingContext, Scroll, Servo,
     ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WebViewVector,
 };
@@ -52,7 +52,7 @@ pub struct Delegate {
     frame_ready: Cell<bool>,
     /// window.open / target=_blank で作られた新しい WebView の作成要求
     new_view: RefCell<Option<CreateNewWebViewRequest>>,
-    /// 読み込みを終えたタブ。spin で今のタブか確かめ、入力欄にフォーカスがあるか調べる
+    /// 読み込みを終えたタブ。take_loaded で今のタブか確かめる
     loaded: RefCell<Vec<WebView>>,
 }
 
@@ -99,8 +99,6 @@ pub struct Engine {
     ctx: Rc<SoftwareRenderingContext>,
     /// GL から BGRA で読み出せるか。読めなければ RGBA (Servo の read_to_image) に切り替える
     bgra: Cell<bool>,
-    /// 今のタブが読み込みを終えたとき、入力欄にフォーカスが当たっていた (FOCUS_JS の結果)
-    input_focused: Rc<Cell<bool>>,
     pub width: u32,
     pub height: u32,
 }
@@ -127,7 +125,6 @@ impl Engine {
             servo,
             ctx,
             bgra: Cell::new(true),
-            input_focused: Rc::default(),
             width,
             height,
         })
@@ -144,8 +141,6 @@ impl Engine {
 
     /// Servo のイベントループを 1 回回す。ページが新しいウィンドウを開こうとしていたら
     /// (window.open, target=_blank)、今のタブの右に新しいタブとして開く。
-    /// 今のタブが読み込みを終えていたら、入力欄にフォーカスがあるか調べる
-    /// (結果は後の spin で届き、take_input_focused で受け取る)。
     pub fn spin(&mut self) {
         self.servo.spin_event_loop();
         let req = self.delegate.new_view.borrow_mut().take();
@@ -156,20 +151,11 @@ impl Engine {
                 .build();
             self.add_tab(view);
         }
-        let loaded = std::mem::take(&mut *self.delegate.loaded.borrow_mut());
-        if loaded.contains(self.view()) {
-            let focused = self.input_focused.clone();
-            self.view().evaluate_javascript(hints::FOCUS_JS, move |r| match r {
-                Ok(JSValue::Boolean(true)) => focused.set(true),
-                Ok(_) => {}
-                Err(e) => eprintln!("[focus] JS が失敗: {e:?}"),
-            });
-        }
     }
 
-    /// 読み込みを終えた今のタブで、入力欄にフォーカスが当たっていたら true を返す (1 回だけ)。
-    pub fn take_input_focused(&self) -> bool {
-        self.input_focused.replace(false)
+    /// 前に呼んでから、今のタブが読み込みを終えたか。
+    pub fn take_loaded(&self) -> bool {
+        std::mem::take(&mut *self.delegate.loaded.borrow_mut()).contains(self.view())
     }
 
     /// URL を新しいタブで開き、そのタブを表示する。

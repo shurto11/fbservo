@@ -1,7 +1,7 @@
 //! リンクヒント (f)。fbrowse と同じく、クリックできる要素に 2 文字のラベルをページの
 //! DOM として差し込み、ラベルを打つとその要素の中心をクリックする。入力欄なら、そのまま
-//! 入力モードへ入る (fbrowse の i の代わり)。ページを開いたときに入力欄へフォーカスが
-//! 当たっているかを調べる JS も、入力欄の判定を共有するのでここに置く。
+//! 入力モードへ入る (fbrowse の i の代わり)。ページが入力欄に当てたフォーカスを外す JS も、
+//! 入力欄の判定を共有するのでここに置く。
 //!
 //! ラベルはページの中に描かれるので、自前で絵に文字を重ねる仕組みは要らない。
 
@@ -12,7 +12,7 @@ use std::rc::Rc;
 /// ラベルに使う文字。ヒントモードで f を取消に使うため f は入れない (fbrowse と同じ)。
 pub const LABEL_CHARS: &str = "asdjklghqwertuiopzxcvbnm";
 
-/// 要素が文字を打てる入力欄かを調べる JS の関数 (SHOW_JS と FOCUS_JS で使う)。
+/// 要素が文字を打てる入力欄かを調べる JS の関数 (SHOW_JS と BLUR_JS で使う)。
 /// textarea と、文字を打てる種類の input。無効や読み取り専用のものは除く。
 macro_rules! is_editable_js {
     () => {
@@ -61,19 +61,14 @@ pub const SHOW_JS: &str = concat!(
 })()"#
 );
 
-/// 読み込み終えたページで入力欄にフォーカスが当たっているかを返す (検索欄など)。
-/// Servo 0.7 は autofocus 属性でフォーカスを当てないので、ほかに何もフォーカスされて
-/// いなければ、autofocus の付いた入力欄に代わりに当てる。
-pub const FOCUS_JS: &str = concat!(
+/// 入力欄にフォーカスが当たっていたら外す (ページが検索欄などに当てたものや、入力モードを
+/// Esc で抜けたあと)。入力欄に文字が入るのは、リンクヒントで選んだときだけにする
+/// (フォーカスが残っていると、ノーマルモードでページへ送る Space や矢印がそこに入る)。
+pub const BLUR_JS: &str = concat!(
     "(() => {\n  const isEditable = ",
     is_editable_js!(),
     r#";
-  const active = document.activeElement;
-  if (!active || active === document.body) {
-    const el = document.querySelector('[autofocus]');
-    if (isEditable(el)) el.focus();
-  }
-  return isEditable(document.activeElement);
+  if (isEditable(document.activeElement)) document.activeElement.blur();
 })()"#
 );
 
