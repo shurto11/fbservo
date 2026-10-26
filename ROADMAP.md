@@ -92,7 +92,7 @@ Servo の修正 1 件 (1px 未満の箱がスクロールを吸う問題。READM
 |---|---|---|---|---|
 | 2-1 | **済** クリック注入 | 座標を指定して `MouseMove` → `MouseButton` を送る | 小 | — |
 | 2-2 | **済** リンクヒント `f` | fbrowse の `HINTS_JS` を `evaluate_javascript` で流す。ラベルはページの DOM に差し込むので、自前で描く必要はない | 中 | browser.rs `HINTS_JS` |
-| 2-3 | プロファイル保存 | `Opts::config_dir` に `~/.local/share/fbservo` を渡す (cookie・HSTS・Web Storage)。cookie の同意バナーや DuckDuckGo の設定を、起動のたびにやり直さずに済む | 小 | — |
+| 2-3 | **済** プロファイル保存 | `Opts::config_dir` に `~/.local/share/fbservo` を渡す (cookie・HSTS・Web Storage)。cookie の同意バナーや DuckDuckGo の設定を、起動のたびにやり直さずに済む。cookie と HSTS は Servo が終わるときにだけ書き出されるので、ペインを閉じたとき (SIGHUP) と SIGTERM でも `Q` と同じく後片付けして終わる。Basic 認証のパスワード (`auth_cache.json`) は残さない (`/dev/null` へのリンクにする) | 小 | — |
 | 2-4 | お気に入りと起動プロンプト | `~/.config/fbrowse/favorites.json` を共有する。`t` と起動時に Tab 補完、`o` で追加、`list` `help` `quit`。std・docs.rs・The Book などをすぐ開けるようにする。検索語に DuckDuckGo の !bang を付ければ std や crates.io を直接引ける (使える bang は要確認) | 中 | favorites.rs, main.rs |
 | 2-5 | ページ内検索 `/` | `/` で検索語を入れ、`n` / `N` で次 / 前へ。長いドキュメントの中で目当ての所へ飛ぶ。Servo にページ内検索の API があるかを調べ、無ければ JS で本文の文字を探して印を差し込み、`scrollIntoView` する (リンクヒントと同じやり方) **[要調査]** | 中 | — |
 | 2-6 | クリップボードとコードのコピー | `ClipboardDelegate` を tmux のペーストバッファにつなぐ。mdBook や rustdoc のコピーボタンがそのまま使える見込み (Servo の `navigator.clipboard` がここを通るかは要確認)。コピーボタンの無いページ用に、`Y` でコードブロックにヒントを出し、選んだブロックの文字をコピーする。`p` で表示 | 小〜中 | tmux.rs, hints.rs |
@@ -139,7 +139,9 @@ Servo の修正 1 件 (1px 未満の箱がスクロールを吸う問題。READM
   ここが効く。
 - Servo が落ちたとき (`notify_crashed`) に、理由を出して再読み込みできるようにする。
 - Servo の版上げ。上げるたびに `vendor/servo-paint` のパッチがまだ要るかを
-  `testpages/subpixel-overflow.html` で確かめる。
+  `testpages/subpixel-overflow.html` で確かめる。`auth_cache.json` を `/dev/null` へのリンクにして
+  パスワードを残さないやり方は、Servo がそのファイルを開いて書く作りに頼っているので、まだ効くかも確かめる
+  (別のファイルに書いて置き換える作りになると、リンクが消えてパスワードが残る)。
 
 ## 作らないもの
 

@@ -3,6 +3,7 @@
 //!
 //! 動作中は端末に何も出さない (出すとページの絵を上書きする)。ログは
 //! $XDG_RUNTIME_DIR/fbservo.log に書き、終了時にそのパスを表示する。
+//! cookie などは $XDG_DATA_HOME/fbservo (既定は ~/.local/share/fbservo) に残す。
 
 mod drmterm;
 mod engine;
@@ -20,8 +21,10 @@ use fb::{Fb, Image, Rect};
 use hints::HintMode;
 use kbd::{Kbd, Press};
 use smooth::{Pace, Smooth};
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use term::{Key, RawMode};
@@ -95,6 +98,51 @@ fn resolve(input: &str) -> Option<Url> {
     Url::parse(&format!("https://duckduckgo.com/?q={}", encode_component(input))).ok()
 }
 
+/// cookie・HSTS・Web Storage を残す場所。次に起動したときも、cookie の同意や
+/// DuckDuckGo の設定が残っている。$XDG_DATA_HOME/fbservo か ~/.local/share/fbservo。
+/// 相対パスは使わない (HOME が無いときに、起動したディレクトリへ cookie を書いてしまう)。
+fn profile_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let abs = |v: Option<OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let data = abs(xdg_data_home).or_else(|| abs(home).map(|h| h.join(".local/share")))?;
+    Some(data.join("fbservo"))
+}
+
+/// 保存先を用意する。cookie はログインの印そのもので、読めればパスワード無しでなりすませるので、
+/// ディレクトリには自分しか入れないようにする (前からあるディレクトリも毎回直す)。
+fn prepare_profile(profile: &Path) -> Result<()> {
+    std::fs::create_dir_all(profile).with_context(|| format!("{} を作れません", profile.display()))?;
+    std::fs::set_permissions(profile, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("{} を自分だけのものにできません", profile.display()))?;
+    forget_passwords(profile)
+}
+
+/// Basic 認証の ID とパスワードは残さない。Servo は終了するときに auth_cache.json へ平文で
+/// 書き出すので、そこを /dev/null へのリンクにして、書いても捨てられるようにする
+/// (動いている間はメモリに持つので、認証はその回の間だけ効く)。
+fn forget_passwords(profile: &Path) -> Result<()> {
+    let path = profile.join("auth_cache.json");
+    if std::fs::read_link(&path).is_ok_and(|t| t == Path::new("/dev/null")) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&path);
+    std::os::unix::fs::symlink("/dev/null", &path).with_context(|| format!("{} を /dev/null に向けられません", path.display()))
+}
+
+/// 終わりの合図 (SIGHUP: ペインやウィンドウを閉じた、SIGTERM) を poll で受け取る fd。
+/// 合図でそのまま死ぬと、Servo が cookie を書き出さない (書くのは終了するときだけ) ので、
+/// Q と同じく後片付けをして終わる。Servo などのスレッドを作る前に呼ぶ (合図を止めた
+/// マスクがスレッドに引き継がれ、どのスレッドにも配られなくなる)。
+fn quit_signals() -> RawFd {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC)
+    }
+}
+
 fn log_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     Path::new(&dir).join("fbservo.log")
@@ -160,6 +208,7 @@ fn main() {
     }
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let quit_fd = quit_signals();
 
     let mut fb = match Fb::open() {
         Ok(fb) => fb,
@@ -176,20 +225,22 @@ fn main() {
         unsafe { libc::dup2(f.as_raw_fd(), 2) };
     }
 
-    let result = run(&mut fb, target.as_deref(), full);
+    let result = run(&mut fb, target.as_deref(), full, quit_fd);
 
     unsafe { libc::dup2(orig_stderr, 2) };
-    print!("\x1b[2J\x1b[H");
+    // ペインを閉じて終わったときは端末がもう無い (書けなくても止まらないよう、print! は使わない)
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[2J\x1b[H");
     if let Err(e) = &result {
-        eprintln!("エラー: {e:#}");
+        let _ = writeln!(std::io::stderr(), "エラー: {e:#}");
     }
-    println!("ログ: {}", log.display());
+    let _ = writeln!(out, "ログ: {}", log.display());
     if result.is_err() {
         std::process::exit(1);
     }
 }
 
-fn run(fb: &mut Fb, target: Option<&str>, full: bool) -> Result<()> {
+fn run(fb: &mut Fb, target: Option<&str>, full: bool, quit_fd: RawFd) -> Result<()> {
     let (wake_fd, waker) = engine::pipe_waker()?;
     let first = target.and_then(resolve);
     let mode = if first.is_some() { Mode::Normal } else { Mode::Prompt(Open::Here, String::new()) };
@@ -242,8 +293,13 @@ fn run(fb: &mut Fb, target: Option<&str>, full: bool) -> Result<()> {
     let mut drawn = false;
     eprintln!("[start] {url} ({}x{} at {},{})", area.w, area.h, area.x, area.y);
 
+    let profile = profile_dir(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+        .context("HOME が無いので、cookie などを残す場所が決まりません")?;
+    prepare_profile(&profile)?;
+    eprintln!("[profile] {}", profile.display());
+
     let _raw = RawMode::enter();
-    let mut eng = Engine::new(area.w, area.h, url, waker)?;
+    let mut eng = Engine::new(area.w, area.h, url, waker, profile)?;
     if let Mode::Prompt(open, buf) = &ui.mode {
         show_prompt(*open, buf);
     }
@@ -278,7 +334,7 @@ fn run(fb: &mut Fb, target: Option<&str>, full: bool) -> Result<()> {
             let base = if eng.animating() { 16 } else { 1000 };
             ui.smooth.timeout().map_or(base, |t| t.min(base))
         };
-        let mut fds: Vec<libc::pollfd> = [0, wake_fd]
+        let mut fds: Vec<libc::pollfd> = [0, wake_fd, quit_fd]
             .into_iter()
             .chain(ui.kbd.fds())
             .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
@@ -312,7 +368,12 @@ fn run(fb: &mut Fb, target: Option<&str>, full: bool) -> Result<()> {
                 redraw = shown;
             }
         }
-        if fds[0].revents & libc::POLLIN != 0 {
+        // 終わりの合図を受けたら、端末はもう読まない (ペインを閉じたなら読めない)
+        let mut quit = fds[2].revents & libc::POLLIN != 0;
+        if quit {
+            eprintln!("[quit] 終わりの合図 (SIGHUP / SIGTERM) を受けました");
+        }
+        if !quit && fds[0].revents & libc::POLLIN != 0 {
             let n = stdin.read(&mut buf).context("標準入力を読めません")?;
             if n == 0 {
                 break;
@@ -330,18 +391,23 @@ fn run(fb: &mut Fb, target: Option<&str>, full: bool) -> Result<()> {
                     Action::None => {}
                     Action::Redraw => redraw = true,
                     Action::Quit => {
-                        fb.set_rect(None);
-                        // 隠れている間は、自分の絵はもう画面に無い (消すと映っている別のものを塗りつぶす)
-                        if shown && drawn {
-                            fb.clear(area);
-                        }
-                        if follow && repaint {
-                            tmux::refresh_clients();
-                        }
-                        return Ok(());
+                        quit = true;
+                        break;
                     }
                 }
             }
+        }
+        // 戻ると eng が drop され、Servo が cookie などを書き出して終わる
+        if quit {
+            fb.set_rect(None);
+            // 隠れている間は、自分の絵はもう画面に無い (消すと映っている別のものを塗りつぶす)
+            if shown && drawn {
+                fb.clear(area);
+            }
+            if follow && repaint {
+                tmux::refresh_clients();
+            }
+            return Ok(());
         }
         // スクロールの流し始め (流している間は、コマを描いたところで次の分を送る)
         if let Some((dx, dy)) = ui.smooth.next(Instant::now(), pace.interval()) {
@@ -862,6 +928,18 @@ mod tests {
         assert_eq!(normal_cmd(&Key::Ctrl('u'), &mut g), Cmd::Screen(-1.0));
         assert!(matches!(normal_cmd(&Key::Enter, &mut g), Cmd::NotNeeded(_)));
         assert_eq!(normal_cmd(&Key::Char(' '), &mut g), Cmd::Page(Key::Char(' ')));
+    }
+
+    #[test]
+    fn profile_dir_is_absolute() {
+        let p = |x: &str, h: &str| profile_dir(Some(x.into()), Some(h.into()));
+        assert_eq!(p("/x", "/h"), Some(PathBuf::from("/x/fbservo")));
+        // 空や相対の XDG_DATA_HOME は使わない (XDG の決まり)
+        assert_eq!(p("", "/h"), Some(PathBuf::from("/h/.local/share/fbservo")));
+        assert_eq!(p("x", "/h"), Some(PathBuf::from("/h/.local/share/fbservo")));
+        // HOME も無ければ決めない (起動したディレクトリに書かない)
+        assert_eq!(p("", ""), None);
+        assert_eq!(profile_dir(None, None), None);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 #    fbservo は /dev/fb0 へ描こうとするが、内蔵画面には描かせない
 #  - ユーザーのとは別の tmux サーバのペインで動かす
 #  - 偽の drmterm は、ソケットができてから fbservo を起動する (wait_sock)
+#  - cookie などの保存先 (XDG_DATA_HOME) も一時ディレクトリにする (ユーザーのものを書き換えない)
 
 set -eu
 BENCH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -56,7 +57,7 @@ start_tmux() {
 # ログは $T/fbservo.log
 start_fbservo() {
     tmux -S "$T/t.sock" split-window -h -b -l 80 -t ext -c "$REPO" -P -F '#{pane_id}' \
-        "env $* FBSERVO_FB=$T/fb0 XDG_RUNTIME_DIR=$T timeout 120 $FBSERVO $URL"
+        "env $* FBSERVO_FB=$T/fb0 XDG_RUNTIME_DIR=$T XDG_DATA_HOME=$T/data timeout 120 $FBSERVO $URL"
 }
 
 keys() {

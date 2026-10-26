@@ -13,11 +13,12 @@ use euclid::Point2D;
 use servo::{
     Code, ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, DeviceVector2D,
     EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, RenderingContext, Scroll, Servo,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, Opts, RenderingContext, Scroll, Servo,
     ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WebViewVector,
 };
 use std::cell::{Cell, RefCell};
 use std::os::fd::RawFd;
+use std::path::PathBuf;
 use std::rc::Rc;
 use url::Url;
 
@@ -104,13 +105,16 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(width: u32, height: u32, url: Url, waker: Box<dyn EventLoopWaker>) -> Result<Engine> {
+    /// profile は cookie・HSTS・Web Storage を残すディレクトリ (あること)。
+    pub fn new(width: u32, height: u32, url: Url, waker: Box<dyn EventLoopWaker>, profile: PathBuf) -> Result<Engine> {
         let ctx = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize::new(width, height))
                 .map_err(|e| anyhow!("ソフトウェア GL を初期化できません: {e:?}"))?,
         );
         ctx.make_current().map_err(|e| anyhow!("make_current: {e:?}"))?;
-        let servo = ServoBuilder::default().event_loop_waker(waker).build();
+        // cookie と HSTS は、Servo が終了するときにだけ書き出される (Servo を drop したとき)
+        let opts = Opts { config_dir: Some(profile), ..Opts::default() };
+        let servo = ServoBuilder::default().opts(opts).event_loop_waker(waker).build();
         servo.setup_logging();
         let delegate = Rc::new(Delegate::default());
         let view = WebViewBuilder::new(&servo, ctx.clone())

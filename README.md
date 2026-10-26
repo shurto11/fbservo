@@ -95,6 +95,20 @@ fbservo だけのキー: `L` で進む、`O` で今の URL を編集して開く
 URL の入力欄 (`t` `O`、起動時) とキー一覧 (`?`) は端末に出し、その間は絵を止める (uim-fep など端末の IME の
 変換中の文字も見える)。
 
+## 残すもの
+
+cookie・HSTS・Web Storage (localStorage など) を `$XDG_DATA_HOME/fbservo` (既定は `~/.local/share/fbservo`)
+に残す。cookie の同意バナーや DuckDuckGo の設定を、起動のたびにやり直さずに済む。
+ログインも続く (ログインした状態は cookie そのものなので、読まれるとパスワード無しでなりすませる)。
+そのためディレクトリは起動するたびに自分だけが入れるようにする (`0700`)。
+
+- Web Storage はその場で書く。cookie と HSTS は、Servo が終わるときにだけ書き出す (`cookie_jar.json`、`hsts_list.json`)。
+- `Q` や `Ctrl-C` のほか、ペインやウィンドウを閉じたとき (SIGHUP) と SIGTERM でも、書き出してから終わる。
+  `kill -9` や Servo が落ちたときは、その回に増えた cookie は残らない。
+- 2 つ同時に動かすと、Web Storage は共有されるが、cookie は後に終わったほうが持っていた分で上書きされる。
+- Basic 認証の ID とパスワードは残さない。Servo は終わるときに `auth_cache.json` へ平文で書き出すので、
+  起動するたびにそこを `/dev/null` へのリンクにしておく (動いている間だけメモリに持つ)。
+
 ## ログと計測
 
 動作中は端末に何も出さない (出すとページの絵を上書きするため)。Servo のログ、
@@ -150,6 +164,7 @@ glReadPixels で BGRA のまま読む (fb0 の XRGB8888 と同じ並び。下の
 
 - Servo の型は `Rc` なので、すべて 1 スレッドで扱う。Servo が別スレッドから起こしたいときは
   `EventLoopWaker` が pipe に 1 バイト書き、メインループは標準入力とその pipe を `poll` する。
+  終わりの合図 (SIGHUP・SIGTERM) も `signalfd` で同じ `poll` に受ける。
 - `notify_new_frame_ready` が来たら `paint` → `read_to_image` → `present` → fb0 に書く。
 - 端末 (tmux の時計など) に上書きされても戻るよう、変化が無くても 1 秒ごとに直前のフレームを描き直す。
 - tmux のペイン追従は別スレッドで `tmux display-message` を 500ms ごとに呼び、変わったときだけ
