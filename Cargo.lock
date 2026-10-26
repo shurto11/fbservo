@@ -5366,8 +5366,6 @@ dependencies = [
 [[package]]
 name = "servo-layout"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "675bf3cb0127b58dde2d072f783c2c57d92c271abd037bc76c781a778af285f4"
 dependencies = [
  "accesskit",
  "app_units",

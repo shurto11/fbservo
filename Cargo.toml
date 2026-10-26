@@ -20,10 +20,15 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 # multiprocess / clipboard は使わない (クリップボードは X/Wayland 前提)
 servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit"] }
 
-# 1px 未満しかはみ出していない overflow: auto の箱がスクロールを吸い込む問題を直した版
+# servo-paint: 1px 未満しかはみ出していない overflow: auto の箱がスクロールを吸い込む問題を直した版
 # (vendor/servo-paint/webview_renderer.rs の scroll_node_or_ancestor_skipping_subpixel)
+# servo-layout: 絶対配置の子を親の padding の分だけずらして数え、scrollHeight / scrollWidth が
+# padding-top / padding-left の分だけ大きくなる問題を直した版。ResizeSensor で枠を中身に合わせるページ
+# (情報処理学会の電子図書館など) が、枠を伸ばし続ける
+# (vendor/servo-layout/fragment_tree/box_fragment.rs の calculate_scrollable_overflow)
 [patch.crates-io]
 servo-paint = { path = "vendor/servo-paint" }
+servo-layout = { path = "vendor/servo-layout" }
 
 [profile.release]
 opt-level = 3

@@ -172,9 +172,13 @@ glReadPixels で BGRA のまま読む (fb0 の XRGB8888 と同じ並び。下の
 - 書き込み先は `FBSERVO_FB` で差し替えられる (動作確認用。サイズは fb0 と同じ前提)。
   キーボードは `FBSERVO_KBD` に `:` 区切りでパスを書くとそこから読む (`input_event` を書き込む FIFO など)。
 
-## Servo への修正 (`vendor/servo-paint`)
+## Servo への修正 (`vendor/`)
 
-`servo-paint` 0.7.0 を `vendor/` に置き、`Cargo.toml` の `[patch.crates-io]` で差し替えている。
+`servo-paint` 0.7.0 と `servo-layout` 0.7.0 を `vendor/` に置き、`Cargo.toml` の `[patch.crates-io]` で
+差し替えている。Servo を上げるときは、パッチを外して下の確認用ページで再現するか見る。
+
+### `vendor/servo-paint`: 1px 未満しかはみ出さない箱がスクロールを吸う
+
 変えたのは `webview_renderer.rs` の `scroll_node_or_ancestor_skipping_subpixel` だけ。
 
 - 元の Servo は、スクロールを画面上のその位置にある最も内側のスクロール領域へ先に渡す。
@@ -184,7 +188,24 @@ glReadPixels で BGRA のまま読む (fb0 の XRGB8888 と同じ並び。下の
   先頭で `k` を押すと箱が元に戻るので、次の `j` もまた吸われる。
 - 修正版は、スクロールした軸の方向に 1px 以上動ける領域だけを対象にする。
 - `testpages/subpixel-overflow.html` で確かめられる。中央の箱の上で `j` `k` を押したとき、
-  1 回目から毎回動けば正しい。Servo を上げるときは、パッチを外してこのページで再現するか見る。
+  1 回目から毎回動けば正しい。
+
+### `vendor/servo-layout`: padding のある箱の `scrollHeight` が padding の分だけ大きい
+
+変えたのは `fragment_tree/box_fragment.rs` の `calculate_scrollable_overflow` だけ。
+
+- 絶対配置の子は、親の padding box を基準に置かれる。元の Servo は、はみ出しを数えるときに
+  ほかの子と同じく内容の箱 (padding の内側) を基準にずらすので、`padding-top` / `padding-left` の分だけ
+  下・右へはみ出していると数える。`scrollHeight` / `scrollWidth` がその分大きくなる (見た目の位置は正しい)。
+- css-element-queries の `ResizeSensor` は、見張る箱に `position: absolute` の子を入れる。WEKO
+  (情報処理学会の電子図書館 `ipsj.ixsq.nii.ac.jp` など) は、その箱の `scrollHeight` が `clientHeight` より
+  大きければ箱を 1 段伸ばし、伸びると `ResizeSensor` がまた知らせる。上の誤差で `scrollHeight` が
+  いつも `padding-top` (32px) だけ大きいので、開いたあと箱が伸び続け、その下の本文が押し下げられ続けた
+  (伸び始めるかは読み込みのタイミングによる)。
+- 修正版は、絶対配置 (と、この箱が包含ブロックになる固定配置) の子だけ padding box を基準にする。
+  上流の Servo (main) も同じコードのまま。
+- `testpages/abspos-padding-overflow.html` で確かめられる。2 つの箱が `scrollHeight` と `clientHeight` に
+  同じ値を出し、下の赤い帯が動かなければ正しい。
 
 ## ファイル
 
@@ -203,4 +224,6 @@ glReadPixels で BGRA のまま読む (fb0 の XRGB8888 と同じ並び。下の
 | `bench/` | スクロールの滑らかさを測る道具 (`bench/README.md`) |
 | `CLAUDE.md` | 作業するときの決まり (画面を守る、何を測るか) |
 | `vendor/servo-paint/` | 上の修正を入れた servo-paint 0.7.0 (MPL-2.0) |
-| `testpages/subpixel-overflow.html` | その修正の確認用ページ |
+| `vendor/servo-layout/` | 上の修正を入れた servo-layout 0.7.0 (MPL-2.0) |
+| `testpages/subpixel-overflow.html` | servo-paint の修正の確認用ページ |
+| `testpages/abspos-padding-overflow.html` | servo-layout の修正の確認用ページ |

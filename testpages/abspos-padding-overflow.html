@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>abspos padding overflow</title>
+<style>
+  body { margin: 0; font: 20px sans-serif; }
+  .box { position: relative; overflow: hidden; padding-top: 32px; height: 100px; background: #eef; }
+  .box > .abs { position: absolute; top: 0; bottom: 0; left: 0; right: 0; }
+  .below { padding: 8px; background: #fdd; }
+</style>
+<p>padding-top: 32px の箱に、padding box いっぱいの絶対配置の子 (inset: 0) がある。
+はみ出すものは無いので、scrollHeight は clientHeight と同じになるはず。</p>
+<div class="box" id="fixed"><div class="abs"></div>高さを変えない箱: <span></span></div>
+<p>情報処理学会の電子図書館 (WEKO) と同じく、scrollHeight が clientHeight より大きければ
+14px ずつ伸ばす箱。同じなら 1 回で止まり、下の赤い帯は動かない。</p>
+<div class="box" id="grow"><div class="abs"></div>中身に合わせる箱: <span></span></div>
+<div class="below">この帯が下へ動き続けたら、scrollHeight が padding-top の分だけ大きい</div>
+<script>
+  function show(box) {
+    box.querySelector('span').textContent = 'scrollHeight ' + box.scrollHeight + ' / clientHeight ' + box.clientHeight;
+  }
+  var fixed = document.getElementById('fixed');
+  var grow = document.getElementById('grow');
+  show(fixed);
+  setInterval(function () {
+    if (grow.scrollHeight > grow.clientHeight) {
+      grow.style.height = grow.getBoundingClientRect().height - 32 + 14 + 'px';
+    }
+    show(grow);
+  }, 500);
+</script>

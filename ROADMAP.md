@@ -138,9 +138,9 @@ Servo の修正 1 件 (1px 未満の箱がスクロールを吸う問題。READM
   差し替えることになり、Servo のほぼ全体を作り直す)。勉強用のページは長い (std の `Vec` など) ので、
   ここが効く。
 - Servo が落ちたとき (`notify_crashed`) に、理由を出して再読み込みできるようにする。
-- Servo の版上げ。上げるたびに `vendor/servo-paint` のパッチがまだ要るかを
-  `testpages/subpixel-overflow.html` で確かめる。`auth_cache.json` を `/dev/null` へのリンクにして
-  パスワードを残さないやり方は、Servo がそのファイルを開いて書く作りに頼っているので、まだ効くかも確かめる
+- Servo の版上げ。上げるたびに `vendor/servo-paint` と `vendor/servo-layout` のパッチがまだ要るかを
+  `testpages/subpixel-overflow.html` と `testpages/abspos-padding-overflow.html` で確かめる。
+  `auth_cache.json` を `/dev/null` へのリンクにしてパスワードを残さないやり方は、Servo がそのファイルを開いて書く作りに頼っているので、まだ効くかも確かめる
   (別のファイルに書いて置き換える作りになると、リンクが消えてパスワードが残る)。
 
 ## 作らないもの
