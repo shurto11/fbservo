@@ -230,7 +230,9 @@ fn main() {
     unsafe { libc::dup2(orig_stderr, 2) };
     // ペインを閉じて終わったときは端末がもう無い (書けなくても止まらないよう、print! は使わない)
     let mut out = std::io::stdout();
+    // 消してから出す (改行が無いとたまったままになり、あとで出すエラーまで消してしまう)
     let _ = write!(out, "\x1b[2J\x1b[H");
+    let _ = out.flush();
     if let Err(e) = &result {
         let _ = writeln!(std::io::stderr(), "エラー: {e:#}");
     }
